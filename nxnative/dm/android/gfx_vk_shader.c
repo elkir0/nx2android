@@ -43,21 +43,26 @@ static const bent *find(uint64_t key) {
 int vk_shader_stage(uint64_t key) { bundle_auto(); const bent *e = g_bundle ? find(key) : NULL; return e ? (int)e->stage : -1; }   // the NVN stage the bundle has this shader as
 
 // Run-time capture: a shader a draw needs that the bundle does not have is saved as DM_ROOT/captured_shaders/<key>.bin ("DMSC", u32 control length, u32 code length, the control
-// section as its key hashed it, the code area), and the porter translates the folder into the bundle at the next port (porter/pipeline.py, shader_vk.py --capture).
+// section as its key hashed it (an NVN2 one with the bytes after its key's, below), the code area), and the porter translates the folder into the bundle at the next port (porter/pipeline.py, shader_vk.py --capture).
 // Xenoblade Chronicles 3 sets hundreds of programs whose code is in no game file (GLSLC outputs of its Firehawk effects, and vertex / pixel shaders of models: a machine near
 // the camera in Everlight Plain drew as a black silhouette, its depth pre-pass drawn and its G-buffer draw skipped); 51 of them in the opening and the first field.
 // The game may free a control section once SetShaders returns, so SetShaders keeps a copy of each one the bundle lacks (shader_set); the file is written only when a draw misses
-// the key (vk_shader_missing) and the code area then still hashes to it
-typedef struct { uint64_t key, data; uint32_t nctl, ncode; uint8_t *ctl; } pend_t;
-enum { NPEND = 4096 };
+// the key (vk_shader_missing) and the code area then still hashes to it.
+// The key's control bytes are hle_nvn.c's (nvn_ctl_lens): NVN's section up to its own length (0x880 at most), NVN2's (Switch 2, version 0xc9) first 0x48 bytes with +0x30 as zero. An
+// NVN2 section is kept longer than its key, as the translation reads it (shader_vk.py nvn2_job: compute's layout to +0xbb, a task or mesh shader's facts to +0x68): 0xd0 bytes, the
+// shortest NVN2 section seen (0xd8 in BNSH files, 0xd0 in effects; its length is 0 in memory, so it cannot be read there)
+typedef struct { uint64_t key, data; uint32_t nctl, ncode, nkey; uint8_t *ctl; } pend_t;
+enum { NPEND = 4096, NVN2_SAVE_CTL = 0xd0 };
 static pend_t g_pend[NPEND]; static unsigned g_npend; static pthread_mutex_t g_pend_mu = PTHREAD_MUTEX_INITIALIZER;
+static int nvn2_section(const uint8_t *c) { uint32_t m[2]; memcpy(m, c, 8); return m[0] == 0x98761234u && m[1] == 0xc9; }
 static void shader_set(const uint8_t k[8], const void *control, uint64_t data, uint32_t ncode) {
     uint64_t key = 0; for (int i = 0; i < 8; i++) key = key << 8 | k[i];
     if (!key || !control || !data || !ncode || ncode >= (1u << 24) || vk_shader_stage(key) >= 0) return;
-    uint32_t nctl = 0x880, own; memcpy(&own, (const uint8_t *)control + 0x20, 4); if (own >= 0x760 && own < 0x880) nctl = own;   // as hle_nvn.c keys_hash
+    uint32_t nkey, nc; nvn_ctl_lens(control, &nkey, &nc);   // as hle_nvn.c keys_hash
+    uint32_t nctl = nvn2_section(control) ? NVN2_SAVE_CTL : nkey;
     uint8_t *c = malloc(nctl); if (!c) return; memcpy(c, control, nctl);
     pthread_mutex_lock(&g_pend_mu);
-    pend_t *p = &g_pend[g_npend++ % NPEND]; free(p->ctl); *p = (pend_t){key, data, nctl, ncode, c};   // the oldest goes: a draw needs a program soon after it is set
+    pend_t *p = &g_pend[g_npend++ % NPEND]; free(p->ctl); *p = (pend_t){key, data, nctl, ncode, nkey, c};   // the oldest goes: a draw needs a program soon after it is set
     pthread_mutex_unlock(&g_pend_mu);
 }
 __attribute__((constructor)) static void shader_set_on(void) { extern void (*g_nvn_on_shader)(const uint8_t *, const void *, uint64_t, uint32_t); g_nvn_on_shader = shader_set; }
@@ -67,7 +72,9 @@ void vk_shader_missing(uint64_t key) {
     for (unsigned i = 0; i < NPEND && i < g_npend; i++) if (g_pend[i].key == key && g_pend[i].ctl) { p = g_pend[i]; p.ctl = malloc(p.nctl); if (p.ctl) memcpy(p.ctl, g_pend[i].ctl, p.nctl); break; }
     pthread_mutex_unlock(&g_pend_mu);
     if (!p.ctl) { VKLOG("[RED] shader %016llx is not in the bundle (and was not set while the capture could see it)", (unsigned long long)key); return; }
-    uint8_t md[CC_SHA256_DIGEST_LENGTH]; CC_SHA256_CTX hc; CC_SHA256_Init(&hc); CC_SHA256_Update(&hc, p.ctl, p.nctl); CC_SHA256_Update(&hc, (const void *)(uintptr_t)p.data, p.ncode); CC_SHA256_Final(md, &hc);
+    uint8_t md[CC_SHA256_DIGEST_LENGTH], kc[0x880]; CC_SHA256_CTX hc; CC_SHA256_Init(&hc);
+    memcpy(kc, p.ctl, p.nkey); if (nvn2_section(p.ctl)) memset(kc + 0x30, 0, 4);   // the key's control bytes (hle_nvn.c keys_hash)
+    CC_SHA256_Update(&hc, kc, p.nkey); CC_SHA256_Update(&hc, (const void *)(uintptr_t)p.data, p.ncode); CC_SHA256_Final(md, &hc);
     uint64_t now = 0; for (int i = 0; i < 8; i++) now = now << 8 | md[i];
     if (now != key) { VKLOG("[RED] shader %016llx is not in the bundle; its code area changed since SetShaders, not saved", (unsigned long long)key); free(p.ctl); return; }
     const char *r = getenv("DM_ROOT"); char dir[1024], path[1100], tmp[1110]; snprintf(dir, sizeof dir, "%s/captured_shaders", r ? r : "."); mkdir(dir, 0755);
@@ -80,11 +87,15 @@ void vk_shader_missing(uint64_t key) {
     else VKLOG("[RED] shader %016llx is not in the bundle: saved to %s, the next port translates it", (unsigned long long)key, path);
     free(p.ctl);
 }
+// NVN2's task and mesh shaders are the bundle's stages 6 and 7 (shader_vk.py STAGES; the program binds them in the tessellation stages' places, gfx_vk_exec.c bind_program). A mesh
+// pipeline draws the mesh shader in the vertex place and the task shader in the geometry place (gfx_vk_exec.c mesh_draw), so their bindings take those places' sets, 0 and 2:
+// three sets at most, as for a vertex pipeline (Adreno's maxBoundDescriptorSets is small)
 static VkShaderStageFlags stage_flag(int st) {
     switch (st) { case 0: return VK_SHADER_STAGE_VERTEX_BIT; case 1: return VK_SHADER_STAGE_FRAGMENT_BIT; case 2: return VK_SHADER_STAGE_GEOMETRY_BIT;
-                  case 3: return VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT; case 4: return VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT; default: return VK_SHADER_STAGE_COMPUTE_BIT; }
+                  case 3: return VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT; case 4: return VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
+                  case 6: return VK_SHADER_STAGE_TASK_BIT_EXT; case 7: return VK_SHADER_STAGE_MESH_BIT_EXT; default: return VK_SHADER_STAGE_COMPUTE_BIT; }
 }
-static int set_of(int st) { return st == 5 ? 0 : st == 0 ? 0 : st == 1 ? 1 : st == 2 ? 2 : st; }
+static int set_of(int st) { return st == 5 ? 0 : st == 0 ? 0 : st == 1 ? 1 : st == 2 ? 2 : st == 6 ? 2 : st == 7 ? 0 : st; }
 static VkDescriptorType desc_type(int d) {
     switch (d) { case RD_UBO: return VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; case RD_SSBO: return VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; case RD_SAMPLED: return VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
                  case RD_STORAGE: return VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; case RD_TBUF: return VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER; case RD_STORAGE_TBUF: return VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER;
@@ -116,6 +127,101 @@ static void spv_io_locs(const uint32_t *w, uint32_t nw, uint32_t *in, uint32_t *
                     break; }
                 j += m; } }
         i += n; }
+}
+// A fragment shader's colour 0 (the alpha test reads its alpha: spv_alpha_test): the Output variable at Location 0 without an Index past 0. Returns VK_COL0_* (gfx_vk.h) and, for a vec4 of
+// 32-bit floats, the variable, its vector type and its float type
+static int spv_col0(const uint32_t *w, uint32_t nw, uint32_t *var, uint32_t *v4, uint32_t *f32) {
+    uint32_t bound = w[3], fn = nw, cv = 0; int kind = VK_COL0_NONE; uint8_t *loc0 = calloc(bound, 1); if (!loc0) return VK_COL0_NONE;
+    for (uint32_t i = 5; i < nw;) { uint32_t n = w[i] >> 16, op = w[i] & 0xffff; if (!n || i + n > nw) { free(loc0); return VK_COL0_NONE; } if (op == 54) { fn = i; break; }
+        if (op == 71 && n == 4 && w[i + 1] < bound && ((w[i + 2] == 30 && w[i + 3] == 0) || (w[i + 2] == 32 && w[i + 3] > 0)))
+            loc0[w[i + 1]] |= w[i + 2] == 30 ? 1 : 2;   // Location 0 (1), an Index past 0 (2: a dual-source second output)
+        i += n; }
+    for (uint32_t i = 5; i < fn && !cv;) { uint32_t n = w[i] >> 16; if ((w[i] & 0xffff) == 59 && n >= 4 && w[i + 3] == 3 && w[i + 2] < bound && loc0[w[i + 2]] == 1) cv = i; i += n; }   // OpVariable ... Output
+    free(loc0);
+    if (!cv) return VK_COL0_NONE;
+    uint32_t t = 0, c = 0, cnt = 0, comp = 0, width = 0;
+    for (uint32_t i = 5; i < fn;) { uint32_t n = w[i] >> 16; if ((w[i] & 0xffff) == 32 && n == 4 && w[i + 1] == w[cv + 1]) t = w[i + 3]; i += n; }   // its pointer type's pointee
+    for (uint32_t i = 5; i < fn && t;) { uint32_t n = w[i] >> 16; if ((w[i] & 0xffff) == 23 && n == 4 && w[i + 1] == t) { c = w[i + 2]; cnt = w[i + 3]; } i += n; }   // OpTypeVector
+    for (uint32_t i = 5; i < fn && c;) { uint32_t n = w[i] >> 16, op = w[i] & 0xffff; if ((op == 21 || op == 22) && w[i + 1] == c) { comp = op; width = w[i + 2]; } i += n; }
+    kind = comp == 21 ? VK_COL0_INT : comp == 22 && width == 32 && cnt == 4 ? VK_COL0_FLOAT : VK_COL0_OTHER;
+    if (kind == VK_COL0_FLOAT) { if (var) *var = w[cv + 2]; if (v4) *v4 = t; if (f32) *f32 = c; }
+    return kind;
+}
+// A mesh shader's per-primitive outputs, by location: variables decorated PerPrimitiveEXT (5271) and Location (the translator's MeshStage.cs writes the NVN2 mesh shader's second SPH so)
+static uint32_t spv_prim_locs(const uint32_t *w, uint32_t nw) {
+    uint32_t bound = w[3], m = 0; uint8_t *pp = calloc(bound, 1); if (!pp) return 0;
+    for (uint32_t i = 5; i < nw;) { uint32_t n = w[i] >> 16; if (!n || (w[i] & 0xffff) == 54) break; if ((w[i] & 0xffff) == 71 && n >= 3 && w[i + 2] == 5271 && w[i + 1] < bound) pp[w[i + 1]] = 1; i += n; }
+    for (uint32_t i = 5; i < nw;) { uint32_t n = w[i] >> 16; if (!n || (w[i] & 0xffff) == 54) break; if ((w[i] & 0xffff) == 71 && n == 4 && w[i + 2] == 30 && w[i + 1] < bound && pp[w[i + 1]] && w[i + 3] < 32) m |= 1u << w[i + 3]; i += n; }
+    free(pp); return m;
+}
+// The binding numbers (bit = binding & 63) whose images the module takes level numbers of: spv_lod_shift's sites (vkshader_t lod_ops)
+static uint64_t spv_lod_bindings(const uint32_t *w, uint32_t nw) {
+    uint64_t m = 0; uint8_t *bn = calloc(w[3], 1); if (!bn) return 0;   // 1 + the binding & 63 of a variable, and of the ids taken from it
+    for (uint32_t i = 5; i < nw;) { uint32_t n = w[i] >> 16, op = w[i] & 0xffff; if (!n || i + n > nw) break;
+        if (op == 71 && n >= 4 && w[i + 2] == 33 && w[i + 1] < w[3]) bn[w[i + 1]] = (uint8_t)(1 + (w[i + 3] & 63));   // OpDecorate Binding
+        if ((op == 61 || op == 65 || op == 66 || op == 83 || op == 100 || op == 86) && n >= 4 && w[i + 2] < w[3] && w[i + 3] < w[3] && bn[w[i + 3]]) bn[w[i + 2]] = bn[w[i + 3]];
+        if ((op == 105 || op == 106 || op == 103 || (op == 88 && n > 5 && w[i + 5] & 2) || (op == 90 && n > 6 && w[i + 6] & 2) || (op == 95 && n > 5 && w[i + 5] & 2)) && n >= 4 && w[i + 3] < w[3] && bn[w[i + 3]])
+            m |= 1ull << (bn[w[i + 3]] - 1);
+        i += n; }
+    free(bn); return m;
+}
+// A fragment shader drawn after a mesh shader with per-primitive outputs: Vulkan matches such an output only with an input decorated PerPrimitiveEXT, and that decoration
+// belongs to SPV_EXT_mesh_shader, which takes SPIR-V 1.4. The translator writes SPIR-V 1.3, so the variant becomes 1.4 (version, the capability MeshShadingEXT and the extension,
+// every global variable in the entry point's interface, its storage buffers moved from Uniform + BufferBlock, which 1.4 has no more, to StorageBuffer + Block, and the access
+// chains into them retyped) and decorates the inputs at the locations in mask PerPrimitiveEXT, without interpolation decorations (a primitive's value is one for all its
+// fragments). Mario Kart World 1.8.0: 11 of its 19 mesh shaders write attributes per primitive (up to 4). NULL when the module is not as expected
+static uint32_t *spv_per_primitive(const uint32_t *w, uint32_t nw, uint32_t mask, uint32_t *onw) {
+    uint32_t bound = w[3], fn = 0, ep = 0; enum { NEW = 256 };
+    uint8_t *bb = calloc(bound, 1), *sbptr = calloc(bound, 1), *sbvar = calloc(bound, 1), *glob = calloc(bound, 1), *ppvar = calloc(bound, 1), *inp = calloc(bound, 1);
+    uint32_t *ptr_pointee = calloc(bound, 4), *ptr_class = calloc(bound, 4), *sbof = calloc(bound, 4), *loc = calloc(bound, 4), newt[NEW][2], nnew = 0;   // newt: {pointee, id} of StorageBuffer pointers made
+    uint32_t *o = NULL;
+    if (!bb || !sbptr || !sbvar || !glob || !ppvar || !inp || !ptr_pointee || !ptr_class || !sbof || !loc) goto done;
+    for (uint32_t i = 5; i < nw;) { uint32_t n = w[i] >> 16, op = w[i] & 0xffff; if (!n || i + n > nw) goto done;
+        if (op == 54) { fn = i; break; }
+        if (op == 15) { if (ep) goto done; ep = i; }
+        if (op == 71 && n >= 3 && w[i + 2] == 3 && w[i + 1] < bound) bb[w[i + 1]] = 1;   // BufferBlock
+        if (op == 71 && n == 4 && w[i + 2] == 30 && w[i + 1] < bound) loc[w[i + 1]] = w[i + 3] + 1;   // Location (+1: 0 = none)
+        if (op == 32 && n == 4 && w[i + 1] < bound) { ptr_class[w[i + 1]] = w[i + 2]; ptr_pointee[w[i + 1]] = w[i + 3]; }
+        if (op == 59 && n >= 4 && w[i + 2] < bound && w[i + 3] != 7) { glob[w[i + 2]] = 1; if (w[i + 3] == 1) inp[w[i + 2]] = 1; }
+        i += n; }
+    if (!fn || !ep) goto done;
+    for (uint32_t t = 1; t < bound; t++) if (ptr_class[t] == 2 && ptr_pointee[t] < bound && bb[ptr_pointee[t]]) sbptr[t] = 1;   // Uniform pointers to BufferBlock structures
+    for (uint32_t i = 5; i < fn;) { uint32_t n = w[i] >> 16; if ((w[i] & 0xffff) == 59 && w[i + 1] < bound && sbptr[w[i + 1]] && w[i + 2] < bound) sbvar[w[i + 2]] = 1; i += n; }
+    for (uint32_t v = 1; v < bound; v++) if (inp[v] && loc[v] && loc[v] <= 32 && (mask >> (loc[v] - 1) & 1)) ppvar[v] = 1;
+    // the access chains into the storage buffers: their pointer types in StorageBuffer, made once per pointee (an existing one is taken)
+    for (uint32_t i = fn; i < nw;) { uint32_t n = w[i] >> 16, op = w[i] & 0xffff; if (!n) goto done;
+        if ((op == 65 || op == 66) && n >= 4 && w[i + 3] < bound && w[i + 2] < bound && (sbvar[w[i + 3]] || sbof[w[i + 3]])) {
+            uint32_t pointee = ptr_pointee[w[i + 1]], id = 0;
+            for (uint32_t t = 1; t < bound && !id; t++) if (ptr_class[t] == 12 && ptr_pointee[t] == pointee) id = t;
+            for (uint32_t k = 0; k < nnew && !id; k++) if (newt[k][0] == pointee) id = newt[k][1];
+            if (!id) { if (nnew == NEW) goto done; id = bound + nnew; newt[nnew][0] = pointee; newt[nnew][1] = id; nnew++; }
+            sbof[w[i + 2]] = id; }
+        i += n; }
+    uint32_t nglob = 0, nppv = 0; for (uint32_t v = 1; v < bound; v++) { nglob += glob[v]; nppv += ppvar[v]; }
+    o = malloc(((size_t)nw + 16 + nglob + 4 * nnew + 3 * nppv) * 4); if (!o) goto done;
+    uint32_t no = 5; memcpy(o, w, 20); o[1] = 0x00010400; o[3] = bound + nnew;
+    int capped = 0;
+    for (uint32_t i = 5; i < nw;) { uint32_t n = w[i] >> 16, op = w[i] & 0xffff;
+        if (i == fn) { for (uint32_t k = 0; k < nnew; k++) { o[no++] = 4u << 16 | 32; o[no++] = newt[k][1]; o[no++] = 12; o[no++] = newt[k][0]; } }   // OpTypePointer StorageBuffer
+        if (op != 17 && !capped) { o[no++] = 2u << 16 | 17; o[no++] = 5283;   // OpCapability MeshShadingEXT, OpExtension "SPV_EXT_mesh_shader", after the capabilities
+            static const char ext[20] = "SPV_EXT_mesh_shader"; o[no++] = 6u << 16 | 10; memcpy(&o[no], ext, 20); no += 5; capped = 1; }
+        if (i == ep) {   // the entry point: its interface and every other global variable
+            uint32_t at = no; memcpy(&o[no], &w[i], n * 4); no += n; uint8_t *in = calloc(bound, 1); if (!in) { free(o); o = NULL; goto done; }
+            uint32_t s = 3; while (s < n && (w[i + s] & 0xff000000u) && (w[i + s] & 0xff) && (w[i + s] & 0xff00) && (w[i + s] & 0xff0000)) s++;   // past the name's words
+            for (s++; s < n; s++) if (w[i + s] < bound) in[w[i + s]] = 1;
+            for (uint32_t v = 1; v < bound; v++) if (glob[v] && !in[v]) o[no++] = v;
+            o[at] = (no - at) << 16 | 15; free(in); i += n; continue; }
+        if (op == 71 && n >= 3 && w[i + 2] == 3) { memcpy(&o[no], &w[i], n * 4); o[no + 2] = 2; no += n; i += n; continue; }   // BufferBlock → Block
+        if (op == 71 && n >= 3 && w[i + 1] < bound && ppvar[w[i + 1]] && (w[i + 2] == 13 || w[i + 2] == 16 || w[i + 2] == 17)) { i += n; continue; }   // NoPerspective, Centroid, Sample
+        if (op == 71 && n == 4 && w[i + 2] == 30 && w[i + 1] < bound && ppvar[w[i + 1]]) { memcpy(&o[no], &w[i], 16); no += 4; o[no++] = 3u << 16 | 71; o[no++] = w[i + 1]; o[no++] = 5271; i += n; continue; }   // + PerPrimitiveEXT
+        if (op == 32 && n == 4 && w[i + 1] < bound && sbptr[w[i + 1]]) { memcpy(&o[no], &w[i], 16); o[no + 2] = 12; no += 4; i += n; continue; }   // Uniform → StorageBuffer
+        if (op == 59 && n >= 4 && w[i + 2] < bound && sbvar[w[i + 2]]) { memcpy(&o[no], &w[i], n * 4); o[no + 3] = 12; no += n; i += n; continue; }
+        if ((op == 65 || op == 66) && n >= 4 && w[i + 2] < bound && sbof[w[i + 2]]) { memcpy(&o[no], &w[i], n * 4); o[no + 1] = sbof[w[i + 2]]; no += n; i += n; continue; }
+        memcpy(&o[no], &w[i], n * 4); no += n; i += n; }
+    *onw = no;
+done:
+    free(bb); free(sbptr); free(sbvar); free(glob); free(ppvar); free(inp); free(ptr_pointee); free(ptr_class); free(sbof); free(loc);
+    return o;
 }
 // A vertex shader's outputs start as (0, 0, 0, 1), as on Maxwell: the translator stores only the components the shader writes and Vulkan leaves the rest
 // undefined (dmsh_build.py vs_init does the same for the Apple chain, found on Link's Awakening's lighting). Pokémon Legends: Arceus's deferred lighting draws
@@ -182,6 +288,13 @@ static uint32_t *spv_add_outputs(const uint32_t *w, uint32_t nw, uint32_t mask, 
 }
 static nvn_hmap g_shaders = {.klen = 16};   // {key, stage} → vkshader_t*
 static pthread_mutex_t g_sh_mu = PTHREAD_MUTEX_INITIALIZER;
+// (gfx_vk_core.c vk_mem_log, the census) the shaders made so far, the SPIR-V they keep (s->spv: each one's, rewritten for its set, kept for its variants; the driver's module holds
+// another copy), their variants
+void vk_shader_mem(uint64_t o[4]) {
+    pthread_mutex_lock(&g_sh_mu);
+    for (uint32_t i = 0; i < g_shaders.cap; i++) { vkshader_t *s = g_shaders.vals[i]; if (!s || s == (void *)1) continue; o[0]++; o[1] += (uint64_t)s->nspv * 4; o[2] += (uint64_t)s->nvar; }
+    pthread_mutex_unlock(&g_sh_mu);
+}
 // Shared layouts keep pipeline layouts and descriptor bindings reusable across shaders; g_sh_mu protects this cache too.
 static VkDescriptorSetLayout shader_layout(const VkDescriptorSetLayoutBinding *b, uint32_t n) {
     struct { uint32_t n, b[96][4]; } k = {.n = n};
@@ -209,11 +322,17 @@ vkshader_t *vk_shader(uint64_t key, int stage) {
     const bent *e = g_bundle ? find(key) : NULL;
     if (!e) { nvn_hm_put(&g_shaders, &hk, (void *)1); pthread_mutex_unlock(&g_sh_mu);
               static int n; if (n++ < 16) VKLOG("[RED] shader %016llx (stage %d) is not in the bundle", (unsigned long long)key, stage); return NULL; }
+    // a task or mesh shader takes the bundle's stage (6, 7), also when asked by the stage its bindings are recorded at (hle_nvn.c st_host: 3, 4)
+    if (e->stage == 6 || e->stage == 7) stage = (int)e->stage;
     s = calloc(1, sizeof *s); s->key = key; s->stage = stage; s->set = set_of(stage);
     // reflection
     const uint8_t *r = g_bundle + e->refl_off; uint32_t hdr[5]; memcpy(hdr, r, 20);
     s->nbind = (int)hdr[0]; s->c1_len = hdr[1]; memcpy(s->local, hdr + 2, 12);
     s->b = (const dmsv_bind *)(r + 20); s->c1 = r + 20 + 20 * s->nbind;
+    // after c1, "FSTR": the stores only a dispatch's first invocation made, taken out of the shader (shader_vk.py first_store), {i32 slot, u32 word, u32 value} each: the replay makes them
+    { uint32_t at = 20 + 20 * (uint32_t)s->nbind + s->c1_len, n = 0;
+      if (e->refl_len >= at + 8 && !memcmp(r + at, "FSTR", 4)) { memcpy(&n, r + at + 4, 4);
+          for (uint32_t i = 0; i < n && i < 4 && at + 8 + 12 * (i + 1) <= e->refl_len; i++) { memcpy(&s->first[i], r + at + 8 + 12 * i, 12); s->nfirst = (int)i + 1; } } }
     // SPIR-V with the stage's set
     uint32_t nw = e->spv_len / 4; uint32_t *w = malloc(e->spv_len); memcpy(w, g_bundle + e->spv_off, e->spv_len);
     int f64_used = 0; uint32_t xb = 4;
@@ -246,7 +365,20 @@ vkshader_t *vk_shader(uint64_t key, int stage) {
         nw = o; } }
     if (stage == 0) { uint32_t n2 = 0, *w2 = spv_vs_init(w, nw, &n2); if (w2) { free(w); w = w2; nw = n2; } }
     spv_io_locs(w, nw, &s->in_locs, &s->out_locs);
-    VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, (size_t)nw * 4, w};
+    if (stage == 7) s->prim_locs = spv_prim_locs(w, nw);
+    if (stage == 1) s->col0 = spv_col0(w, nw, NULL, NULL, NULL);   // (the alpha test: gfx_vk_exec.c pkey atest)
+    { uint64_t lb = spv_lod_bindings(w, nw); for (int i = 0; i < s->nbind && i < 64; i++) if (lb >> (s->b[i].binding & 63) & 1) s->lod_ops |= 1ull << i; }   // (LOD shifts: vk_lodshift_mask)
+    // A compute shader that runs Ampere's tensor instructions per lane (the translator's HMMA helper dmsh_hmma16816_f16: 64 FP32 FMAs and 64 conversions a lane an HMMA; LDSM / MOVM
+    // through subgroup shuffles): agl's NDSR upscaler network, whose 30 shaders Mario Kart World 1.8.0 loads at boot and the game engages as its render size falls (PARITY G4). Said
+    // once a shader, at its load: its first dispatch, the bundle having more compute shaders than compute_warm makes ahead
+    if (stage == 5) { uint32_t hf = 0, calls = 0, shuf = 0;
+        for (uint32_t i = 5; i < nw;) { uint32_t n = w[i] >> 16, op = w[i] & 0xffff; if (!n || i + n > nw) break;
+            if (op == 5 && n >= 7 && !memcmp(&w[i + 2], "dmsh_hmma16816_f16", 18)) hf = w[i + 1];   // OpName
+            if (op == 57 && n >= 4 && hf && w[i + 3] == hf) calls++; if (op == 345) shuf++;   // OpFunctionCall, OpGroupNonUniformShuffle
+            i += n; }
+        if (calls) VKLOG("compute shader %016llx: Ampere tensor instructions emulated per lane (%u HMMA, %u subgroup shuffles): agl's NDSR upscaler network, in use (DM_VK_GPUPROF: the stretch its dispatch falls in)",
+                         (unsigned long long)key, calls, shuf); }
+    VkShaderModuleCreateInfo ci ={VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, (size_t)nw * 4, w};
     VkResult vr = vkCreateShaderModule(V.dev, &ci, NULL, &s->mod); s->spv = w; s->nspv = nw;
     if (vr) { VKLOG("[RED] shader %016llx: vkCreateShaderModule %d", (unsigned long long)key, vr); free(w); free(s); nvn_hm_put(&g_shaders, &hk, (void *)1); pthread_mutex_unlock(&g_sh_mu); return NULL; }
     // descriptor set layout: one entry per binding
@@ -400,33 +532,273 @@ static uint32_t *spv_dual(const uint32_t *w, uint32_t nw, uint32_t *onw) {
     memcpy(&o[at + 8], &w[at + 4], (size_t)(nw - at - 4) * 4); *onw = nw + 4;
     return o;
 }
-static VkShaderModule vk_shader_module_(vkshader_t *s, uint64_t um, uint64_t im, uint32_t xo, int fd);
-VkShaderModule vk_shader_module(vkshader_t *s, uint64_t um, uint64_t im, uint32_t xo, int fd) { extern int g_prof_on; extern uint64_t g_prof_ns[8]; struct timespec a, b; if (g_prof_on) clock_gettime(CLOCK_MONOTONIC, &a);
-    VkShaderModule m = vk_shader_module_(s, um, im, xo, fd); if (g_prof_on) { clock_gettime(CLOCK_MONOTONIC, &b); g_prof_ns[3] += (uint64_t)((b.tv_sec - a.tv_sec) * 1000000000ll + (b.tv_nsec - a.tv_nsec)); } return m; }
-static VkShaderModule vk_shader_module_(vkshader_t *s, uint64_t um, uint64_t im, uint32_t xo, int fd) {
-    int dual = fd >> 1 & 1; fd &= 1;   // fd bit 1: the dual-source variant
-    if (fd && (s->stage != 1 || s->depth_repl)) fd = 0;
+// Two variants of a mesh shader to bisect a driver compile (gfx_vk_exec.c DM_VK_MESH_NOTASK / DM_VK_MESH_POSBLOCK; run 4 of Mario Kart World 1.8.0 crashed in the Adreno 840's compiler
+// building its first task / mesh pipeline). spv_payload_private: the task payload's pointer types and variables take the Private storage class, for a pipeline made without the task
+// stage (the variable stays in the interface, where SPIR-V 1.4 lists every global); the module unchanged when it has none
+static uint32_t *spv_payload_private(const uint32_t *w, uint32_t nw, uint32_t *onw) {
+    uint32_t *o = malloc((size_t)nw * 4); if (!o) return NULL; memcpy(o, w, (size_t)nw * 4);
+    for (uint32_t i = 5; i < nw;) { uint32_t n = w[i] >> 16, op = w[i] & 0xffff; if (!n || i + n > nw) { free(o); return NULL; }
+        if (op == 54) break;   // (the first function: the declarations end)
+        if (op == 32 && n == 4 && w[i + 2] == 5402) o[i + 2] = 6;   // OpTypePointer TaskPayloadWorkgroupEXT → Private
+        if (op == 59 && n >= 4 && w[i + 3] == 5402) o[i + 3] = 6;   // OpVariable
+        i += n; }
+    *onw = nw; return o;
+}
+// spv_pos_block: gl_Position in a per-vertex block, as glslang declares gl_MeshVerticesEXT (the translator writes a standalone vec4 array decorated BuiltIn Position, which drivers meet
+// less): the variable takes an array of a Block struct whose one vec4 member is BuiltIn Position, its access chains member 0 after the vertex index. NULL when the module is not as
+// expected (no such Output array, a use of it other than an access chain, an initializer, no 32-bit integer type)
+static uint32_t *spv_pos_block(const uint32_t *w, uint32_t nw, uint32_t *onw) {
+    uint32_t bound = w[3], fn = nw, pv = 0, dec = 0, var = 0, pt = 0, arr = 0, v4 = 0, len = 0, i32 = 0, c0 = 0, nac = 0;
+    for (uint32_t i = 5; i < nw;) { uint32_t n = w[i] >> 16, op = w[i] & 0xffff; if (!n || i + n > nw) return NULL; if (op == 54) { fn = i; break; }
+        if (op == 71 && n == 4 && w[i + 2] == 11 && w[i + 3] == 0) { pv = w[i + 1]; dec = i; }   // OpDecorate BuiltIn Position
+        if (op == 21 && n == 4 && w[i + 2] == 32 && !i32) i32 = w[i + 1];   // OpTypeInt 32
+        i += n; }
+    if (!pv || fn == nw) return NULL;
+    for (uint32_t i = 5; i < fn;) { uint32_t n = w[i] >> 16, op = w[i] & 0xffff;
+        if (op == 59 && w[i + 2] == pv) { if (n != 4 || w[i + 3] != 3) return NULL; var = i; pt = w[i + 1]; }   // OpVariable Output, no initializer
+        if (op == 43 && n == 4 && w[i + 3] == 0 && !c0) for (uint32_t j = 5; j < fn; j += w[j] >> 16) if ((w[j] & 0xffff) == 21 && w[j + 1] == w[i + 1] && w[j + 2] == 32) { c0 = w[i + 2]; break; }   // OpConstant 0 of an int32
+        i += n; }
+    for (uint32_t i = 5; var && i < fn;) { uint32_t n = w[i] >> 16, op = w[i] & 0xffff;
+        if (op == 32 && w[i + 1] == pt && w[i + 2] == 3) arr = w[i + 3];   // OpTypePointer Output
+        i += n; }
+    for (uint32_t i = 5; arr && i < fn;) { uint32_t n = w[i] >> 16, op = w[i] & 0xffff; if (op == 28 && w[i + 1] == arr) { v4 = w[i + 2]; len = w[i + 3]; } i += n; }   // OpTypeArray
+    { int ok = 0; for (uint32_t i = 5; v4 && i < fn; i += w[i] >> 16) if ((w[i] & 0xffff) == 23 && w[i + 1] == v4 && w[i + 3] == 4) ok = 1; if (!ok || !len || (!c0 && !i32)) return NULL; }   // OpTypeVector of 4
+    for (uint32_t i = fn; i < nw;) { uint32_t n = w[i] >> 16, op = w[i] & 0xffff, uses = 0; if (!n || i + n > nw) return NULL;   // its uses: access chains with a vertex index, nothing else
+        for (uint32_t k = 1; k < n; k++) uses += w[i + k] == pv;
+        if (uses && !((op == 65 || op == 66) && n >= 5 && w[i + 3] == pv && uses == 1)) return NULL;
+        nac += uses; i += n; }
+    uint32_t blk = bound, arr2 = bound + 1, pt2 = bound + 2, nc = c0 ? 0 : 4; if (!c0) c0 = bound + 3;
+    uint32_t *o = malloc(((size_t)nw + 24 + nac) * 4), no = 5; if (!o) return NULL;   // (+4 decorations, +11 types, +4 a constant, a word a chain)
+    memcpy(o, w, 20); o[3] = bound + 3 + (nc ? 1 : 0);
+    for (uint32_t i = 5; i < nw;) { uint32_t n = w[i] >> 16, op = w[i] & 0xffff;
+        if (i == dec) { uint32_t d[8] = {3u << 16 | 71, blk, 2, 5u << 16 | 72, blk, 0, 11, 0}; memcpy(&o[no], d, sizeof d); no += 8; i += n; continue; }   // Block; member 0 BuiltIn Position
+        if (i == var) { uint32_t d[15] = {3u << 16 | 30, blk, v4, 4u << 16 | 28, arr2, blk, len, 4u << 16 | 32, pt2, 3, arr2, 4u << 16 | 59, pt2, pv, 3}; memcpy(&o[no], d, sizeof d); no += 15; i += n; continue; }
+        if (i == fn && nc) { o[no++] = 4u << 16 | 43; o[no++] = i32; o[no++] = c0; o[no++] = 0; }   // OpConstant 0 (before the functions: after every type)
+        if ((op == 65 || op == 66) && i >= fn && w[i + 3] == pv) { o[no++] = (n + 1) << 16 | op; memcpy(&o[no], &w[i + 1], 4 * 4); no += 4; o[no++] = c0; memcpy(&o[no], &w[i + 5], (n - 5) * 4); no += n - 5; i += n; continue; }
+        memcpy(&o[no], &w[i], n * 4); no += n; i += n; }
+    *onw = no; return o;
+}
+// NVN's alpha test (ColorStateSetAlphaTest, SetAlphaRef: Maxwell's fixed-function test of the alpha a pixel shader writes to colour 0, before blending; upstream ee369f09, dmsh_alpha.py's
+// <key>_ba libraries for Metal): Vulkan has none. A fragment shader's alpha test variant (gfx_vk_exec.c pkey atest) gets a new entry point, under the old one's id (its execution modes and
+// name stay with it), that calls the shader's own main and then compares colour 0's alpha with the function and the reference in the push constant range VK_ALPHA_PUSH_OFF (gfx_vk.h; data
+// of each draw, so one pipeline serves every function and reference), and kills the fragment when the comparison fails: after every return of the shader, while a discard of the shader's
+// own ends it before. NVN's functions as dmsh_alpha.py dm_alpha_pass has them: NEVER, LESS a < ref, EQUAL a == ref, LEQUAL a <= ref, GREATER a > ref, NOTEQUAL a != ref (true for a NaN),
+// GEQUAL a >= ref; any other value passes (ALWAYS: drawn without the variant). Only a float colour 0 (spv_col0): an integer one has no test, as upstream. NULL, with why, when the module is
+// not as expected
+static uint32_t spvi_const(spvi *c, uint32_t op, uint32_t type, uint32_t value) {   // an OpConstant (43, value) or OpConstantTrue / OpConstantFalse (41 / 42) of type: found, or added to c->nt
+    uint32_t n = op == 43 ? 4 : 3;
+    for (int pass = 0; pass < 2; pass++) { const uint32_t *a = pass ? c->nt : c->w; uint32_t lo = pass ? 0 : 5, hi = pass ? c->nnt : c->fn;
+        for (uint32_t j = lo; j < hi;) { uint32_t m = a[j] >> 16; if (!m) break; if ((a[j] & 0xffff) == op && m == n && a[j + 1] == type && (op != 43 || a[j + 3] == value)) return a[j + 2]; j += m; } }
+    if (c->nnt + n > 4096) return 0;
+    uint32_t id = c->bound++; c->nt[c->nnt++] = n << 16 | op; c->nt[c->nnt++] = type; c->nt[c->nnt++] = id; if (op == 43) c->nt[c->nnt++] = value; return id;
+}
+static uint32_t *spv_alpha_test(const uint32_t *w, uint32_t nw, uint32_t *onw, const char **why) {
+    spvi c = {.w = w, .fn = nw, .bound = w[3]}; uint32_t ep = 0, epn = 0, epfn = 0, firsttype = 0, colv = 0, v4 = 0, f32 = 0, fnat = 0, none[1] = {0};
+    for (uint32_t i = 5; i < nw;) { uint32_t n = w[i] >> 16, op = w[i] & 0xffff; if (!n || i + n > nw) { *why = "a malformed module"; return NULL; }
+        if (op == 15) { if (ep || n < 3 || w[i + 1] != 4) { *why = "not one fragment entry point"; return NULL; } ep = i; epn = n; epfn = w[i + 2]; }
+        if (op == 59 && n >= 4 && w[i + 3] == 9) { *why = "a push constant block of its own"; return NULL; }   // (one an entry point at most)
+        if (!firsttype && ((op >= 19 && op <= 39) || (op >= 41 && op <= 52) || op == 59)) firsttype = i;   // the first type, constant or variable: the annotations end here
+        if (op == 54) { c.fn = i; break; }   // the first OpFunction
+        i += n; }
+    if (!ep || !firsttype || c.fn == nw) { *why = "no entry point or no function"; return NULL; }
+    int k0 = spv_col0(w, nw, &colv, &v4, &f32); if (k0 != VK_COL0_FLOAT) { *why = k0 == VK_COL0_NONE ? "no colour 0 output" : "colour 0 has no float alpha"; return NULL; }
+    for (uint32_t i = c.fn; i < nw;) { uint32_t n = w[i] >> 16, op = w[i] & 0xffff; if (!n || i + n > nw) { *why = "a malformed module"; return NULL; }
+        if (op == 54 && n == 5 && w[i + 2] == epfn) fnat = i;
+        if (op == 57 && n >= 4 && w[i + 3] == epfn) { *why = "its entry point is called"; return NULL; }   // OpFunctionCall
+        i += n; }
+    if (!fnat) { *why = "no entry point function"; return NULL; }
+    if (!(c.nt = malloc(4096 * 4))) { *why = "no memory"; return NULL; }
+    uint32_t vd = w[fnat + 1], fty = w[fnat + 4], u32 = spvi_scalar(&c, 1), bl = spvi_decl(&c, 20, none, 0, 1), k[8], tru, fls;
+    for (uint32_t v = 0; v < 8; v++) k[v] = spvi_const(&c, 43, u32, v);
+    tru = spvi_const(&c, 41, bl, 0); fls = spvi_const(&c, 42, bl, 0);
+    uint32_t st = c.bound++; if (c.nnt + 4 <= 4096) { c.nt[c.nnt++] = 4u << 16 | 30; c.nt[c.nnt++] = st; c.nt[c.nnt++] = u32; c.nt[c.nnt++] = f32; }   // OpTypeStruct {uint func; float ref;}
+    uint32_t o1[2] = {9, st}, o2[2] = {9, u32}, o3[2] = {9, f32}; uint32_t pps = spvi_decl(&c, 32, o1, 2, 0), ppu = spvi_decl(&c, 32, o2, 2, 1), ppf = spvi_decl(&c, 32, o3, 2, 1);   // PushConstant pointers
+    uint32_t pcv = c.bound++; if (c.nnt + 4 <= 4096) { c.nt[c.nnt++] = 4u << 16 | 59; c.nt[c.nnt++] = pps; c.nt[c.nnt++] = pcv; c.nt[c.nnt++] = 9; }   // OpVariable PushConstant
+    int ok = u32 && bl && tru && fls && pps && ppu && ppf && c.nnt + 8 <= 4096; for (int v = 0; v < 8; v++) ok &= k[v] != 0;
+    if (!ok) { free(c.nt); *why = "no room for its declarations"; return NULL; }
+    uint32_t orig = c.bound++, iface = w[1] >= 0x10400;   // the shader's own main, under a new id; SPIR-V 1.4 lists every global the entry point uses in its interface
+    uint32_t *o = malloc(((size_t)nw + c.nnt + 256) * 4), no = 5; if (!o) { free(c.nt); *why = "no memory"; return NULL; }
+    memcpy(o, w, 20);
+    for (uint32_t i = 5; i < c.fn;) { uint32_t n = w[i] >> 16;
+        if (i == firsttype) { uint32_t d[13] = {3u << 16 | 71, st, 2, 5u << 16 | 72, st, 0, 35, VK_ALPHA_PUSH_OFF, 5u << 16 | 72, st, 1, 35, VK_ALPHA_PUSH_OFF + 4};   // Block, member Offsets
+                              memcpy(&o[no], d, sizeof d); no += 13; }
+        if (i == ep && iface) { o[no++] = (epn + 1) << 16 | 15; memcpy(&o[no], &w[i + 1], (epn - 1) * 4); no += epn - 1; o[no++] = pcv; }
+        else { memcpy(&o[no], &w[i], n * 4); no += n; }
+        i += n; }
+    memcpy(&o[no], c.nt, c.nnt * 4); no += c.nnt;
+    memcpy(&o[no], &w[c.fn], (size_t)(nw - c.fn) * 4); o[no + (fnat - c.fn) + 2] = orig; no += nw - c.fn;   // the functions, the entry point's renamed
+    uint32_t l0 = c.bound++, lk = c.bound++, lm = c.bound++, call = c.bound++, p0 = c.bound++, fv = c.bound++, p1 = c.bound++, ref = c.bound++, col = c.bound++, a = c.bound++;
+    uint32_t x[] = {5u << 16 | 54, vd, epfn, 0, fty, 2u << 16 | 248, l0, 4u << 16 | 57, vd, call, orig,   // OpFunction (the entry point's id), OpLabel, OpFunctionCall main
+                    5u << 16 | 65, ppu, p0, pcv, k[0], 4u << 16 | 61, u32, fv, p0, 5u << 16 | 65, ppf, p1, pcv, k[1], 4u << 16 | 61, f32, ref, p1,   // the function, the reference
+                    4u << 16 | 61, v4, col, colv, 5u << 16 | 81, f32, a, col, 3};   // colour 0, its alpha
+    memcpy(&o[no], x, sizeof x); no += sizeof x / 4;
+    static const uint16_t CMP[6] = {184, 180, 188, 186, 183, 190};   // LESS FOrdLessThan, EQUAL FOrdEqual, LEQUAL FOrdLessThanEqual, GREATER FOrdGreaterThan, NOTEQUAL FUnordNotEqual, GEQUAL FOrdGreaterThanEqual
+    uint32_t cmp[6]; for (int j = 0; j < 6; j++) { cmp[j] = c.bound++; o[no++] = 5u << 16 | CMP[j]; o[no++] = bl; o[no++] = cmp[j]; o[no++] = a; o[no++] = ref; }
+    uint32_t r = tru;   // pass = func == 1 ? false : func == 2 ? a < ref : ... func == 7 ? a >= ref : true
+    for (uint32_t f = 7; f >= 1; f--) { uint32_t e = c.bound++, s = c.bound++;
+        o[no++] = 5u << 16 | 170; o[no++] = bl; o[no++] = e; o[no++] = fv; o[no++] = k[f];   // OpIEqual
+        o[no++] = 6u << 16 | 169; o[no++] = bl; o[no++] = s; o[no++] = e; o[no++] = f == 1 ? fls : cmp[f - 2]; o[no++] = r; r = s; }   // OpSelect
+    uint32_t y[] = {3u << 16 | 247, lm, 0, 4u << 16 | 250, r, lm, lk, 2u << 16 | 248, lk, w[1] >= 0x10600 ? 1u << 16 | 4416 : 1u << 16 | 252,   // if (!pass) OpKill (OpTerminateInvocation in SPIR-V 1.6)
+                    2u << 16 | 248, lm, 1u << 16 | 253, 1u << 16 | 56};   // OpReturn, OpFunctionEnd
+    memcpy(&o[no], y, sizeof y); no += sizeof y / 4;
+    o[3] = c.bound; *onw = no; free(c.nt); return o;
+}
+// Images that start at a coarser level of their texture (vkimg_t lv0: a dense image of a sparse texture whose format the device cannot make sparse-resident, a sparse one past
+// the sparse address space; a view moved to its first mapped level, sp_vbase): the shader works in the texture's level numbers and its view's level 0 is the texture's level B.
+// Mario Kart World 1.8.0: 1,118 pixel shaders sample the BC6H / ASTC terrain and object arrays (dense from level 3 or 4 on the Adreno 840) with
+// textureLod(t, uv, max(min LOD, quantize(textureQueryLod(t, uv).x))): the query answers in the image's levels and the minimum is in the texture's, so the level read was the
+// minimum's plus B, up to 16 times blurrier than the screen needs. The variant adds B to OpImageQueryLod's and OpImageQueryLevels' results, and takes it from explicit Lod
+// operands and from OpImageFetch / OpImageQuerySizeLod levels: a fetch below level B reads the image's level 0 at the texel that covers it (spatial coordinates shifted down), a
+// size below it is level 0's scaled up. Implicit-LOD sampling, gradients and gathers need nothing (the hardware's LOD is the image's own). For the images of up to 8 bindings
+// (bind, nb: binding numbers in that order); B is data, 4 bits a binding (binding i at bits 4i) in the push constant word at off (vk_lodshift_off), so one variant serves every draw
+static uint32_t *spv_lod_shift(const uint32_t *w, uint32_t nw, const uint16_t *bind, int nb, uint32_t off, uint32_t *onw, const char **why) {
+    if (nb < 1 || nb > 8) { *why = "not 1 to 8 bindings"; return NULL; }
+    spvi c = {.w = w, .fn = nw, .bound = w[3]}; uint32_t ep = 0, epn = 0, firsttype = 0, pcv = 0, pst = 0, psti = 0, pstn = 0;
+    uint8_t *nib = calloc(w[3], 1), *dims = calloc(w[3], 1); uint32_t *ity = calloc(w[3], 4), *rty = calloc(w[3], 4);   // nib: 1 + the binding's place; dims: spatial dimensions | 4 arrayed
+    #define LS_FAIL(s) do { free(nib); free(dims); free(ity); free(rty); free(c.nt); *why = s; return NULL; } while (0)
+    if (!nib || !dims || !ity || !rty) LS_FAIL("no memory");
+    for (uint32_t i = 5; i < nw;) { uint32_t n = w[i] >> 16, op = w[i] & 0xffff; if (!n || i + n > nw) LS_FAIL("a malformed module");
+        if (op == 15) { if (ep) LS_FAIL("more than one entry point"); ep = i; epn = n; }
+        if (op == 71 && n >= 4 && w[i + 2] == 33 && w[i + 1] < w[3]) for (int j = 0; j < nb; j++) if (w[i + 3] == bind[j]) nib[w[i + 1]] = (uint8_t)(j + 1);   // OpDecorate Binding
+        if (op == 25 && n >= 9 && w[i + 1] < w[3]) { uint32_t d = w[i + 3]; dims[w[i + 1]] = (uint8_t)((d == 0 ? 1 : d == 2 ? 3 : d == 1 || d == 3 ? 2 : 0) | (w[i + 5] ? 4 : 0)); }   // OpTypeImage: 1D, 2D / Cube, 3D
+        if (op == 27 && n >= 3 && w[i + 1] < w[3]) ity[w[i + 1]] = w[i + 2];   // OpTypeSampledImage: its image type
+        if ((op == 43 || op == 44 || op == 46 || op == 1) && n >= 3 && w[i + 2] < w[3]) rty[w[i + 2]] = w[i + 1];   // a constant's (or undef's) type
+        if (op == 59 && n >= 4 && w[i + 3] == 9) { if (pcv) LS_FAIL("two push constant blocks"); pcv = w[i + 2];
+            for (uint32_t j = 5; j < i;) { uint32_t m = w[j] >> 16; if (!m) break; if ((w[j] & 0xffff) == 32 && m == 4 && w[j + 1] == w[i + 1]) pst = w[j + 3]; j += m; } }   // its struct
+        if (!firsttype && ((op >= 19 && op <= 39) || (op >= 41 && op <= 52) || op == 59)) firsttype = i;   // the first type, constant or variable: the annotations end here
+        if (op == 54) { c.fn = i; break; }   // the first OpFunction
+        i += n; }
+    if (!ep || !firsttype || c.fn == nw) LS_FAIL("no entry point or no function");
+    if (pcv) { for (uint32_t i = 5; i < c.fn;) { uint32_t n = w[i] >> 16; if ((w[i] & 0xffff) == 30 && w[i + 1] == pst) { psti = i; pstn = n - 2; } i += n; }   // OpTypeStruct of the block: n - 2 members
+               if (!psti) LS_FAIL("a push constant block whose type is not a struct"); }
+    // the images of those bindings as the function bodies take them (OpLoad of the variable or of an element of it, OpSampledImage, OpImage, OpCopyObject), and the sites
+    uint32_t sites = 0;
+    for (uint32_t i = c.fn; i < nw;) { uint32_t n = w[i] >> 16, op = w[i] & 0xffff; if (!n || i + n > nw) LS_FAIL("a malformed module");
+        uint32_t r = n >= 3 ? w[i + 2] : 0; if (r >= w[3]) LS_FAIL("an id past the bound");
+        if (op != 248 && op != 62 && op != 247 && op != 246 && op != 249 && op != 250 && op != 251 && op != 253 && op != 254 && n >= 3) rty[r] = w[i + 1];   // a value's type
+        if ((op == 61 || op == 65 || op == 66 || op == 83 || op == 100) && n >= 4 && w[i + 3] < w[3] && nib[w[i + 3]]) nib[r] = nib[w[i + 3]];   // Load / AccessChain / CopyObject / Image
+        if (op == 86 && n >= 5 && w[i + 3] < w[3] && nib[w[i + 3]]) nib[r] = nib[w[i + 3]];   // OpSampledImage (image, sampler)
+        if ((op == 105 || op == 88 || op == 90 || op == 95 || op == 103 || op == 106) && n >= 4 && w[i + 3] < w[3] && nib[w[i + 3]]) sites++;
+        i += n; }
+    if (!sites) LS_FAIL("no level operation on those bindings");
+    if (!(c.nt = malloc(4096 * 4))) LS_FAIL("no memory");
+    uint32_t none[1] = {0}, o32[1] = {32};
+    uint32_t u32 = spvi_scalar(&c, 1), i32 = spvi_scalar(&c, 2), f32 = spvi_decl(&c, 22, o32, 1, 1), bl = spvi_decl(&c, 20, none, 0, 1), k15 = spvi_const(&c, 43, u32, 15), z = spvi_const(&c, 43, i32, 0);
+    uint32_t ksh[8] = {0}; for (int j = 0; j < nb; j++) ksh[j] = spvi_const(&c, 43, u32, 4u * (uint32_t)j);
+    uint32_t mem = pcv ? pstn : 0, kmem = spvi_const(&c, 43, u32, mem), ppu_d[2] = {9, u32}, ppu = spvi_decl(&c, 32, ppu_d, 2, 1), st = pst, nv = 0;
+    if (pcv && u32 >= w[3]) LS_FAIL("a push constant block and no 32-bit uint before it");   // (its struct takes one more member, of a type declared before it)
+    if (!pcv) { uint32_t pps = c.bound++; st = c.bound++; nv = c.bound++;   // a block of its own: struct {uint}, its pointer and variable
+                if (c.nnt + 11 > 4096) LS_FAIL("no room for its declarations");
+                uint32_t d[11] = {3u << 16 | 30, st, u32, 4u << 16 | 32, pps, 9, st, 4u << 16 | 59, pps, nv, 9}; memcpy(&c.nt[c.nnt], d, sizeof d); c.nnt += 11; }
+    uint32_t iv[3]; for (uint32_t q = 0; q < 3; q++) { uint32_t vd[2] = {i32, q + 2}; iv[q] = spvi_decl(&c, 23, vd, 2, 1); }   // ivec2..4: a vector's level shifts
+    int ok = u32 && i32 && f32 && bl && k15 && z && kmem && ppu && iv[0] && iv[1] && iv[2]; for (int j = 0; j < nb; j++) ok &= ksh[j] != 0;
+    if (!ok || c.nnt + 16 > 4096) LS_FAIL("no room for its declarations");
+    uint32_t pvar = pcv ? pcv : nv, iface = w[1] >= 0x10400 && !pcv;   // SPIR-V 1.4 lists every global the entry point uses
+    uint32_t *o = malloc(((size_t)nw + c.nnt + 64 + 72 * (size_t)sites) * 4), no = 5; if (!o) LS_FAIL("no memory");
+    memcpy(o, w, 20);
+    for (uint32_t i = 5; i < c.fn;) { uint32_t n = w[i] >> 16;
+        if (i == firsttype) { if (!pcv) { o[no++] = 3u << 16 | 71; o[no++] = st; o[no++] = 2; }   // Block
+                              o[no++] = 5u << 16 | 72; o[no++] = st; o[no++] = mem; o[no++] = 35; o[no++] = off; }   // OpMemberDecorate Offset
+        if (i == ep && iface) { o[no++] = (epn + 1) << 16 | 15; memcpy(&o[no], &w[i + 1], (epn - 1) * 4); no += epn - 1; o[no++] = nv; }
+        else if (i == psti) { o[no++] = (n + 1) << 16 | 30; memcpy(&o[no], &w[i + 1], (n - 1) * 4); no += n - 1; o[no++] = u32; }   // the block's struct, a member more
+        else { memcpy(&o[no], &w[i], n * 4); no += n; }
+        i += n; }
+    memcpy(&o[no], c.nt, c.nnt * 4); no += c.nnt;
+    for (uint32_t i = c.fn; i < nw;) { uint32_t n = w[i] >> 16, op = w[i] & 0xffff;
+        int site = (op == 105 || op == 88 || op == 90 || op == 95 || op == 103 || op == 106) && n >= 4 && nib[w[i + 3]];
+        if (!site) { memcpy(&o[no], &w[i], n * 4); no += n; i += n; continue; }
+        uint32_t j = nib[w[i + 3]] - 1u, rt = w[i + 1], r = w[i + 2], img = w[i + 3], t = ity[rty[img]] ? ity[rty[img]] : rty[img], dm = t < w[3] ? dims[t] : 0;
+        // B = (word >> 4j) & 15, as uint, int and float
+        uint32_t p = c.bound++, wd = c.bound++, sh = c.bound++, bu = c.bound++, bi = c.bound++, bf = c.bound++;
+        uint32_t x[] = {5u << 16 | 65, ppu, p, pvar, kmem, 4u << 16 | 61, u32, wd, p, 5u << 16 | 194, u32, sh, wd, ksh[j], 5u << 16 | 199, u32, bu, sh, k15,   // AccessChain, Load, >>, &
+                        4u << 16 | 124, i32, bi, bu, 4u << 16 | 112, f32, bf, bu};   // OpBitcast int, OpConvertUToF
+        memcpy(&o[no], x, sizeof x); no += sizeof x / 4;
+        if (op == 105 || op == 106) {   // OpImageQueryLod: + B to both components; OpImageQueryLevels: + B
+            uint32_t r0 = c.bound++; memcpy(&o[no], &w[i], n * 4); o[no + 2] = r0; no += n;
+            if (op == 105) { uint32_t bv = c.bound++; uint32_t y[] = {5u << 16 | 80, rt, bv, bf, bf, 5u << 16 | 129, rt, r, r0, bv}; memcpy(&o[no], y, sizeof y); no += sizeof y / 4; }
+            else { uint32_t y[] = {5u << 16 | 128, rt, r, r0, rt == u32 ? bu : bi}; memcpy(&o[no], y, sizeof y); no += sizeof y / 4; }
+        } else if (op == 88 || op == 90) {   // explicit Lod - B (the sampler's minimum LOD, lowered by B, keeps it from going below the image's level 0)
+            uint32_t mi = op == 88 ? 5 : 6, mask = n > mi ? w[i + mi] : 0, li = mi + 1 + (mask & 1);
+            if (!(mask & 2) || li >= n) { memcpy(&o[no], &w[i], n * 4); no += n; i += n; continue; }
+            uint32_t l2 = c.bound++, y[] = {5u << 16 | 131, f32, l2, w[i + li], bf}; memcpy(&o[no], y, sizeof y); no += sizeof y / 4;   // OpFSub
+            memcpy(&o[no], &w[i], n * 4); o[no + li] = l2; no += n;
+        } else {   // OpImageFetch (its Lod operand) / OpImageQuerySizeLod (its level): d = level - B; the level max(d, 0), and below level B, s = B - level spatial texel shifts
+            uint32_t mask = op == 95 && n > 5 ? w[i + 5] : 0, li = op == 95 ? 6 + (mask & 1) : 4;
+            if ((op == 95 && !(mask & 2)) || li >= n) { memcpy(&o[no], &w[i], n * 4); no += n; i += n; continue; }
+            uint32_t d = c.bound++, neg = c.bound++, l2 = c.bound++, nd = c.bound++, s = c.bound++;
+            uint32_t y[] = {5u << 16 | 130, i32, d, w[i + li], bi, 5u << 16 | 177, bl, neg, d, z, 6u << 16 | 169, i32, l2, neg, z, d,   // OpISub, OpSLessThan, OpSelect
+                            4u << 16 | 126, i32, nd, d, 6u << 16 | 169, i32, s, neg, nd, z};   // OpSNegate, OpSelect
+            memcpy(&o[no], y, sizeof y); no += sizeof y / 4;
+            uint32_t vt = op == 95 ? rty[w[i + 4]] : rt, ncomp = 0;   // the value the shifts apply to: the fetch's coordinates, the query's result
+            for (uint32_t q = 5; q < c.fn;) { uint32_t m = w[q] >> 16, qo = w[q] & 0xffff; if (w[q + 1] == vt) ncomp = qo == 23 ? w[q + 3] : qo == 21 ? 1 : ncomp; q += m; }
+            if (!ncomp || ncomp > 4) { free(o); LS_FAIL("a level operation on a value whose type is not an integer scalar or vector"); }
+            uint32_t sp = dm & 3, sv = s;
+            if (ncomp > 1) { sv = c.bound++; o[no++] = (3 + ncomp) << 16 | 80; o[no++] = iv[ncomp - 2]; o[no++] = sv; for (uint32_t q = 0; q < ncomp; q++) o[no++] = q < sp ? s : z; }   // (s, s, 0): not the layer
+            if (op == 95) { uint32_t c2 = c.bound++; o[no++] = 5u << 16 | 195; o[no++] = vt; o[no++] = c2; o[no++] = w[i + 4]; o[no++] = sv;   // OpShiftRightArithmetic
+                            memcpy(&o[no], &w[i], n * 4); o[no + 4] = c2; o[no + li] = l2; no += n; }
+            else { uint32_t r0 = c.bound++; memcpy(&o[no], &w[i], n * 4); o[no + 2] = r0; o[no + li] = l2; no += n;
+                   o[no++] = 5u << 16 | 196; o[no++] = rt; o[no++] = r; o[no++] = r0; o[no++] = sv; }   // OpShiftLeftLogical
+        }
+        i += n; }
+    free(nib); free(dims); free(ity); free(rty);
+    o[3] = c.bound; *onw = no; free(c.nt); return o;
+    #undef LS_FAIL
+}
+static VkShaderModule vk_shader_module_(vkshader_t *s, uint64_t um, uint64_t im, uint32_t xo, int fd, uint64_t lm);
+// DM_VK_LODSHIFT=0 (start-up): no LOD-shift variant and no push constant words for it, as before
+int vk_lodshift_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_LODSHIFT"); on = !(e && !atoi(e)); } return on; }
+uint32_t vk_lodshift_off(int stage) { return 8u + 4u * (uint32_t)set_of(stage); }
+uint64_t vk_lodshift_mask(const vkshader_t *s, const uint8_t shift[64]) {
+    uint64_t m = 0; int n = 0; if (!s || !vk_lodshift_on()) return 0;
+    for (int i = 0; i < s->nbind && i < 64; i++) if (s->lod_ops >> i & 1 && shift[s->b[i].binding & 63]) { if (n++ == 8) { VKRED_ONCE(170, "shader %016llx: more than 8 bindings with a LOD shift, the 9th on read in the image's level numbers", (unsigned long long)s->key); break; } m |= 1ull << i; }
+    return m;
+}
+uint32_t vk_lodshift_word(const vkshader_t *s, uint64_t lm, const uint8_t shift[64]) {
+    uint32_t v = 0, j = 0; for (int i = 0; i < s->nbind && i < 64 && j < 8; i++) if (lm >> i & 1) { uint32_t b = shift[s->b[i].binding & 63]; v |= (b > 15 ? 15u : b) << (4 * j++); }
+    return v;
+}
+VkShaderModule vk_shader_module_lod(vkshader_t *s, uint64_t um, uint64_t im, uint32_t xo, int fd, uint64_t lm) { extern int g_prof_on; extern uint64_t g_prof_ns[8]; struct timespec a, b; if (g_prof_on) clock_gettime(CLOCK_MONOTONIC, &a);
+    VkShaderModule m = vk_shader_module_(s, um, im, xo, fd, lm); if (g_prof_on) { clock_gettime(CLOCK_MONOTONIC, &b); g_prof_ns[3] += (uint64_t)((b.tv_sec - a.tv_sec) * 1000000000ll + (b.tv_nsec - a.tv_nsec)); } return m; }
+VkShaderModule vk_shader_module(vkshader_t *s, uint64_t um, uint64_t im, uint32_t xo, int fd) { return vk_shader_module_lod(s, um, im, xo, fd, 0); }
+static VkShaderModule vk_shader_module_(vkshader_t *s, uint64_t um, uint64_t im, uint32_t xo, int fd, uint64_t lm) {
+    int dual = fd >> 1 & 1, at = fd >> 2 & 1, mp = fd >> 3 & 1, mb = fd >> 4 & 1; fd &= 1;   // fd bit 1: the dual-source variant; bit 2: the alpha test's (spv_alpha_test); bits 3, 4: a mesh
+    if (fd && (s->stage != 1 || s->depth_repl)) fd = 0;                                       // shader's payload made Private, its gl_Position in a block (spv_payload_private, spv_pos_block)
     if (dual && s->stage != 1) dual = 0;
-    if (!(um | im | xo | (uint32_t)fd | (uint32_t)dual) || !s->spv) return s->mod;
+    if (at && (s->stage != 1 || s->col0 != VK_COL0_FLOAT)) at = 0;
+    if (s->stage != 7) mp = mb = 0;
+    int fv = fd | dual << 1 | at << 2 | mp << 3 | mb << 4;   // (the variant's key)
+    lm &= vk_lodshift_on() ? s->lod_ops : 0;   // (the bindings that take level numbers: vk_lodshift_mask)
+    if (!(um | im | xo | (uint32_t)fv | lm) || !s->spv) return s->mod;
     if (xo == 1u << 31) {   // DM_VK_SPV_ALT
         pthread_mutex_lock(&g_sh_mu); for (int i = 0; i < s->nvar; i++) if (s->var[i].um == 0 && s->var[i].im == 0 && s->var[i].xo == xo) { VkShaderModule m = s->var[i].mod; pthread_mutex_unlock(&g_sh_mu); return m; }
-        VkShaderModule m = alt_module(s); if (s->nvar < 8) s->var[s->nvar++] = (typeof(s->var[0])){0, 0, xo, 0, m}; pthread_mutex_unlock(&g_sh_mu); return m; }
+        VkShaderModule m = alt_module(s); if (s->nvar < 16) s->var[s->nvar++] = (typeof(s->var[0])){0, 0, xo, 0, m}; pthread_mutex_unlock(&g_sh_mu); return m; }
     xo &= ~(1u << 31);
     pthread_mutex_lock(&g_sh_mu);
-    for (int i = 0; i < s->nvar; i++) if (s->var[i].um == um && s->var[i].im == im && s->var[i].xo == xo && s->var[i].fd == (fd | dual << 1)) { VkShaderModule m = s->var[i].mod; pthread_mutex_unlock(&g_sh_mu); return m; }
+    for (int i = 0; i < s->nvar; i++) if (s->var[i].um == um && s->var[i].im == im && s->var[i].xo == xo && s->var[i].fd == fv && s->var[i].lm == lm) { VkShaderModule m = s->var[i].mod; pthread_mutex_unlock(&g_sh_mu); return m; }
     uint16_t bind[64]; uint8_t kind[64]; int nb = 0;
     for (int i = 0; i < s->nbind && i < 64; i++) if ((um | im) >> i & 1) { bind[nb] = s->b[i].binding; kind[nb++] = um >> i & 1 ? 1 : 2; }
     uint32_t nw = s->nspv, *w = nb ? spv_int_images(s->spv, s->nspv, bind, kind, nb, &nw) : NULL; VkShaderModule m = s->mod;
-    if (xo && (w || !nb)) { uint32_t n2 = 0, *w2 = spv_add_outputs(w ? w : s->spv, nw, xo, &n2); free(w); w = w2; nw = n2;
+    // a fragment shader's xo: the inputs a mesh shader writes per primitive (vkshader_t prim_locs), decorated PerPrimitiveEXT (spv_per_primitive); another stage's: outputs to declare
+    if (xo && (w || !nb) && s->stage == 1) { uint32_t n2 = 0, *w2 = spv_per_primitive(w ? w : s->spv, nw, xo, &n2); free(w); w = w2; nw = n2; }
+    else if (xo && (w || !nb)) { uint32_t n2 = 0, *w2 = spv_add_outputs(w ? w : s->spv, nw, xo, &n2); free(w); w = w2; nw = n2;
         if (w && s->stage == 0) { uint32_t n3 = 0, *w3 = spv_vs_init(w, nw, &n3); if (w3) { free(w); w = w3; nw = n3; } } }   // the added outputs start as (0, 0, 0, 1) too
     if (fd && (w || !(nb || xo))) { uint32_t n2 = 0, *w2 = spv_frag_depth(w ? w : s->spv, nw, &n2); free(w); w = w2; nw = n2; }
+    if (at && (w || !(nb || xo || fd))) { const char *why = NULL; uint32_t n2 = 0, *w2 = spv_alpha_test(w ? w : s->spv, nw, &n2, &why);   // (before spv_dual: colour 0 is location 0 alone)
+        if (w2) { free(w); w = w2; nw = n2; } else VKLOG("[RED] shader %016llx: no alpha test variant (%s): its alpha-tested draws go without the test", (unsigned long long)s->key, why ? why : "?"); }
     if (dual && (w || !(nb || xo || fd))) { uint32_t n2 = 0, *w2 = spv_dual(w ? w : s->spv, nw, &n2); free(w); w = w2; nw = n2; }
+    if (mp && (w || !(nb || xo))) { uint32_t n2 = 0, *w2 = spv_payload_private(w ? w : s->spv, nw, &n2); free(w); w = w2; nw = n2; }
+    if (mb && (w || !(nb || xo || mp))) { uint32_t n2 = 0, *w2 = spv_pos_block(w ? w : s->spv, nw, &n2); free(w); w = w2; nw = n2; }
+    if (lm && (w || !(nb || xo || fv))) { uint16_t lb[8]; int nl = 0; const char *why = NULL; uint32_t n2 = 0;   // (last: it adds to a push constant block the alpha test made)
+        for (int i = 0; i < s->nbind && i < 64 && nl < 8; i++) if (lm >> i & 1) lb[nl++] = s->b[i].binding;
+        uint32_t *w2 = spv_lod_shift(w ? w : s->spv, nw, lb, nl, vk_lodshift_off(s->stage), &n2, &why);
+        if (w2) { free(w); w = w2; nw = n2; } else VKLOG("[RED] shader %016llx: no LOD-shift variant (%s): its level numbers stay the image's", (unsigned long long)s->key, why ? why : "?"); }
     if (w) { VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, (size_t)nw * 4, w};
-        if (vkCreateShaderModule(V.dev, &ci, NULL, &m)) { m = s->mod; VKLOG("[RED] shader %016llx: its variant was refused (bindings %#llx / %#llx, outputs %#x, fragment depth %d, dual source %d)", (unsigned long long)s->key, (unsigned long long)um, (unsigned long long)im, xo, fd, dual); }
-        else VKLOG("shader %016llx: variant for bindings %#llx (uint texels) %#llx (int texels), outputs added %#x, fragment depth written %d, dual source %d", (unsigned long long)s->key, (unsigned long long)um, (unsigned long long)im, xo, fd, dual);
+        if (vkCreateShaderModule(V.dev, &ci, NULL, &m)) { m = s->mod; VKLOG("[RED] shader %016llx: its variant was refused (bindings %#llx / %#llx, outputs %#x, fragment depth %d, dual source %d, alpha test %d, payload private %d, position block %d, LOD shift %#llx)", (unsigned long long)s->key, (unsigned long long)um, (unsigned long long)im, xo, fd, dual, at, mp, mb, (unsigned long long)lm); }
+        else VKLOG("shader %016llx: variant for bindings %#llx (uint texels) %#llx (int texels), %s %#x, fragment depth written %d, dual source %d, alpha test %d, LOD shift %#llx%s", (unsigned long long)s->key, (unsigned long long)um, (unsigned long long)im,
+                   s->stage == 1 ? "per-primitive inputs" : "outputs added", xo, fd, dual, at, (unsigned long long)lm, s->stage == 7 ? (mp ? (mb ? ", payload private, position block" : ", payload private") : mb ? ", position block" : "") : "");
         free(w); }
-    else VKLOG("[RED] shader %016llx: no variant could be made (bindings %#llx / %#llx, outputs %#x, fragment depth %d, dual source %d)", (unsigned long long)s->key, (unsigned long long)um, (unsigned long long)im, xo, fd, dual);
-    if (s->nvar < 8) s->var[s->nvar++] = (typeof(s->var[0])){um, im, xo, fd | dual << 1, m};
+    else VKLOG("[RED] shader %016llx: no variant could be made (bindings %#llx / %#llx, outputs %#x, fragment depth %d, dual source %d, alpha test %d, payload private %d, position block %d, LOD shift %#llx)", (unsigned long long)s->key, (unsigned long long)um, (unsigned long long)im, xo, fd, dual, at, mp, mb, (unsigned long long)lm);
+    if (s->nvar < 16) s->var[s->nvar++] = (typeof(s->var[0])){um, im, xo, fv, m, lm};
     pthread_mutex_unlock(&g_sh_mu);
     return m;
 }
@@ -449,6 +821,26 @@ static VkBuffer static_buf(int which) {
 }
 VkBuffer vk_support_buffer(void) { return static_buf(0); }
 VkBuffer vk_zero_buffer(void) { return static_buf(1); }
+// RK_SPILL: the storage buffer that holds the shared memory of compute shaders that declare more than the device gives a workgroup (shader_vk.py SHARED_MAX; the translator's
+// SharedMemorySpill.cs), a slice per workgroup. One buffer for all of them, made as large as the largest asks (48 KB x 512 slices for Mario Kart World's DrivePassShaderDefault,
+// 24 MB); a smaller one is freed once the GPU is past it. Shared memory starts undefined on the console too, so its content between dispatches does not matter, but two
+// dispatches that run together must not share it: the replay orders a dispatch after the work before it (gfx_vk_exec.c)
+VkBuffer vk_spill_buffer(VkDeviceSize size) {
+    static VkBuffer buf; static VkDeviceMemory mem; static VkDeviceSize have; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&mu);
+    if (size > have) {
+        VkBuffer nb; VkDeviceMemory m; VkMemoryRequirements req;
+        VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_SHARING_MODE_EXCLUSIVE};
+        VKCHK(vkCreateBuffer(V.dev, &bi, NULL, &nb)); vkGetBufferMemoryRequirements(V.dev, nb, &req);
+        VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, req.size, vk_mem_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0)};
+        VKCHK(vkAllocateMemory(V.dev, &ai, NULL, &m)); VKCHK(vkBindBufferMemory(V.dev, nb, m, 0));
+        if (buf) vk_defer_free_buffer(buf, mem);
+        buf = nb; mem = m; have = size;
+        VKLOG("compute shared memory in a buffer: %.1f MB", size / 1048576.0);
+    }
+    VkBuffer b = buf; pthread_mutex_unlock(&mu);
+    return b;
+}
 // a shader's c1 constants: copied once into a buffer of their own (the bundle bytes do not change)
 void vk_shader_c1(vkshader_t *s, VkBuffer *buf, VkDeviceSize *off, VkDeviceSize *len) {
     if (!s->c1_len) { *buf = vk_zero_buffer(); *off = 0; *len = 65536; return; }
@@ -461,17 +853,27 @@ void vk_shader_c1(vkshader_t *s, VkBuffer *buf, VkDeviceSize *off, VkDeviceSize 
     }
     *buf = s->c1_buf; *off = 0; *len = (s->c1_len + 255) & ~255u;
 }
-// pipeline layouts by the set layouts of their stages (an empty layout fills the sets of absent stages)
-VkPipelineLayout vk_pipeline_layout(VkDescriptorSetLayout sets[5], int nsets) {
-    static VkDescriptorSetLayout empty; static nvn_hmap cache = {.klen = 5 * sizeof(VkDescriptorSetLayout)}; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+// pipeline layouts by the set layouts of their stages (an empty layout fills the sets of absent stages); a graphics one also has the alpha test's push constant range for the fragment
+// stage (VK_ALPHA_PUSH_OFF), so every graphics layout is compatible with every other one of the same sets for binding them, whether a pipeline takes the alpha test variant or not.
+// With DM_VK_LODSHIFT, every layout has a word for each stage's LOD shifts (vk_lodshift_off): the fragment range runs on to it, vertex / mesh and geometry / task get one each, compute one
+static VkPipelineLayout layout_(VkDescriptorSetLayout sets[5], int nsets, int gfx) {
+    static VkDescriptorSetLayout empty; static nvn_hmap cache = {.klen = 6 * sizeof(VkDescriptorSetLayout)}; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
     pthread_mutex_lock(&mu);
     if (!empty) { VkDescriptorSetLayoutCreateInfo li = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO}; VKCHK(vkCreateDescriptorSetLayout(V.dev, &li, NULL, &empty)); }
-    VkDescriptorSetLayout k[5]; for (int i = 0; i < 5; i++) { k[i] = i < nsets && sets[i] ? sets[i] : (i < nsets ? empty : VK_NULL_HANDLE); if (i < nsets) sets[i] = k[i]; }   // absent stages get the empty layout (the caller allocates their sets from it)
+    VkDescriptorSetLayout k[6]; for (int i = 0; i < 5; i++) { k[i] = i < nsets && sets[i] ? sets[i] : (i < nsets ? empty : VK_NULL_HANDLE); if (i < nsets) sets[i] = k[i]; }   // absent stages get the empty layout (the caller allocates their sets from it)
+    k[5] = (VkDescriptorSetLayout)(uintptr_t)gfx;   // (the cache key's last word)
     VkPipelineLayout pl = nvn_hm_get(&cache, k);
     if (!pl) {
-        VkPipelineLayoutCreateInfo ci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, (uint32_t)nsets, k};
+        VkPushConstantRange pr[3]; uint32_t np = 0; int ls = vk_lodshift_on();
+        if (gfx) { pr[np++] = (VkPushConstantRange){VK_SHADER_STAGE_FRAGMENT_BIT, VK_ALPHA_PUSH_OFF, ls ? vk_lodshift_off(1) + 4 - VK_ALPHA_PUSH_OFF : VK_ALPHA_PUSH_SIZE};
+                   if (ls) pr[np++] = (VkPushConstantRange){VK_SHADER_STAGE_VERTEX_BIT | (V.has_mesh ? VK_SHADER_STAGE_MESH_BIT_EXT : 0), vk_lodshift_off(0), 4};
+                   if (ls && (V.has_gs || V.has_mesh)) pr[np++] = (VkPushConstantRange){(V.has_gs ? VK_SHADER_STAGE_GEOMETRY_BIT : 0) | (V.has_mesh ? VK_SHADER_STAGE_TASK_BIT_EXT : 0), vk_lodshift_off(2), 4}; }
+        else if (ls) pr[np++] = (VkPushConstantRange){VK_SHADER_STAGE_COMPUTE_BIT, vk_lodshift_off(5), 4};
+        VkPipelineLayoutCreateInfo ci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, (uint32_t)nsets, k, np, np ? pr : NULL};
         VKCHK(vkCreatePipelineLayout(V.dev, &ci, NULL, &pl)); nvn_hm_put(&cache, k, pl);
     }
     pthread_mutex_unlock(&mu);
     return pl;
 }
+VkPipelineLayout vk_pipeline_layout(VkDescriptorSetLayout sets[5], int nsets) { return layout_(sets, nsets, 0); }
+VkPipelineLayout vk_pipeline_layout_gfx(VkDescriptorSetLayout sets[5], int nsets) { return layout_(sets, nsets, 1); }

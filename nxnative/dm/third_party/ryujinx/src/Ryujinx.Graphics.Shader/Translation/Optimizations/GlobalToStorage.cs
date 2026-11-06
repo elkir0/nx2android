@@ -316,6 +316,7 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
                 // Otherwise, we generate a function call (and the function if necessary).
 
                 Operand offset = result.Offset;
+                int wordAdd = 0;
 
                 bool storageUnaligned = gpuAccessor.QueryHasUnalignedStorageBuffer();
 
@@ -328,8 +329,30 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
 
                     int alignment = gpuAccessor.QueryHostStorageBufferOffsetAlignment();
 
+                    // nx2android: an address that is another plus a multiple of 4 takes that address's word index plus the constant's words (GenerateInlineStorageOp), so the
+                    // words of one wide access the frontend split (LDG / STG .64 / .128: address + 4j) share their index's computation and differ by j, which a driver can see
+                    // as neighbours; (a + 4j - base) >> 2 hid it. The same word for every offset in 0 .. 2^31 (IGpuAccessor.QueryHostWideStorageWords)
+                    Operand addressBase = globalAddress;
+
+                    if (gpuAccessor.QueryHostWideStorageWords() && CanUseInlineStorageOp(operation, targetLanguage))
+                    {
+                        Operand a = globalAddress;
+
+                        while (a.AsgOp is Operation copy && copy.Inst == Instruction.Copy && copy.SourcesCount == 1)
+                        {
+                            a = copy.GetSource(0);
+                        }
+
+                        if (a.AsgOp is Operation add && add.Inst == Instruction.Add && add.GetSource(1).Type == OperandType.Constant &&
+                            (add.GetSource(1).Value & 3) == 0 && add.GetSource(1).Value > -0x10000 && add.GetSource(1).Value < 0x10000)
+                        {
+                            addressBase = add.GetSource(0);
+                            wordAdd = add.GetSource(1).Value >> 2;
+                        }
+                    }
+
                     Operation maskOp = new(Instruction.BitwiseAnd, baseAddressMasked, baseAddress, Const(-alignment));
-                    Operation subOp = new(Instruction.Subtract, hostOffset, globalAddress, baseAddressMasked);
+                    Operation subOp = new(Instruction.Subtract, hostOffset, addressBase, baseAddressMasked);
 
                     node.List.AddBefore(node, maskOp);
                     node.List.AddBefore(node, subOp);
@@ -349,7 +372,7 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
 
                 if (CanUseInlineStorageOp(operation, targetLanguage))
                 {
-                    return GenerateInlineStorageOp(resourceManager, node, operation, offset, result);
+                    return GenerateInlineStorageOp(resourceManager, node, operation, offset, result, wordAdd);
                 }
                 else
                 {
@@ -406,7 +429,8 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
             LinkedListNode<INode> node,
             Operation operation,
             Operand offset,
-            SearchResult result)
+            SearchResult result,
+            int wordAdd = 0)
         {
             bool isStore = operation.Inst == Instruction.Store || operation.Inst.IsAtomic();
             if (!resourceManager.TryGetStorageBufferBinding(result.SbCbSlot, result.SbCbOffset, isStore, out int binding))
@@ -438,10 +462,21 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
                 sources = [Const(binding), Const(0), wordOffset];
             }
 
-            Operation shiftOp = new(Instruction.ShiftRightU32, wordOffset, offset, Const(2));
             Operation storageOp = new(operation.Inst, StorageKind.StorageBuffer, operation.Dest, sources);
 
-            node.List.AddBefore(node, shiftOp);
+            if (wordAdd != 0)
+            {
+                // nx2android: the base address's word (arithmetic: an address below the base by a constant still lands right) plus the constant's (ReplaceGlobalMemoryWithStorage)
+                Operand baseWord = Local();
+
+                node.List.AddBefore(node, new Operation(Instruction.ShiftRightS32, baseWord, offset, Const(2)));
+                node.List.AddBefore(node, new Operation(Instruction.Add, wordOffset, baseWord, Const(wordAdd)));
+            }
+            else
+            {
+                node.List.AddBefore(node, new Operation(Instruction.ShiftRightU32, wordOffset, offset, Const(2)));
+            }
+
             LinkedListNode<INode> newNode = node.List.AddBefore(node, storageOp);
 
             Utils.DeleteNode(node, operation);
@@ -653,14 +688,26 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
 
             targetCbs.Sort();
 
+            // nx2android: through the memory pool table only for a host that binds it and the write log (IGpuAccessor.QueryHostSupportsRawGlobalMemory). Elsewhere the access is
+            // dropped as Ryujinx drops it, by a helper with no target (a load reads 0): the module would take physical addressing (the device's bufferDeviceAddress) and two storage
+            // buffers the Vulkan replay does not bind yet. Mario Kart World 1.8.0: gsys's common vertex shader c9a56f796ea4a4cd and agl's common compute shader ce770ef0597876ca
+            bool raw = gpuAccessor.QueryHostSupportsRawGlobalMemory();
+
             if (targetCbs.Count == 0)
             {
-                gpuAccessor.Log($"Failed to find storage buffer for global memory operation \"{operation.Inst}\".");
+                gpuAccessor.Log(raw
+                    ? $"Global memory operation \"{operation.Inst}\" traced to no storage buffer: it goes through the memory pool table."
+                    : $"Global memory operation \"{operation.Inst}\" traced to no storage buffer: dropped (the host binds no memory pool table).");
             }
 
             if (gtsContext.TryGetFunctionId(operation, isMultiTarget: true, targetCbs, out functionId))
             {
                 return true;
+            }
+
+            if (targetCbs.Count == 0 && raw)
+            {
+                return TryGenerateRawStorageOp(gtsContext, resourceManager, gpuAccessor, operation, out functionId);
             }
 
             int inArgumentsCount = 2;
@@ -770,6 +817,215 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
                 0);
 
             functionId = gtsContext.AddFunction(operation, isMultiTarget: true, targetCbs, function);
+
+            return true;
+        }
+
+        // nxnative: the memory pool table the host binds for raw global memory (dmsh_abi.h DMSH_GMEM_MAP_*): a storage buffer reserved under this sentinel constant buffer
+        // slot, which no constant buffer of the game has (dmsh_build.py turns it into DMSH_KIND_GMEM_MAP). 1 << GmemMapLog2 entries of GmemMapEntryWords words each,
+        // {start lo, start hi, end lo, end hi, delta lo, delta hi, 0, 0}, sorted by start; entry 0 is empty (start 0, end 0) and unused entries start at ~0
+        public const int GmemMapCbSlot = 0xff;
+        private const int GmemMapLog2 = 12;
+        private const int GmemMapEntryWords = 8;
+
+        // nxnative: the write log (dmsh_abi.h DMSH_GMEM_LOG_*), reserved under the same sentinel slot at offset 1: the set of guest pages (address >> 12) the stores and atomics wrote,
+        // as an open-addressing hash set of 1 << GmemLogLog2 words from word 1 (0 = empty), word 0 set when a page found no free slot in GmemLogProbes tries. The host cannot know where
+        // a store through a loaded pointer lands before the GPU runs it; it learns the pages from the log. A set, not a list: one draw of Donkey Kong Bananza stores 7,325 times into a few dozen pages
+        private const int GmemLogCbOffset = 1;
+        private const int GmemLogLog2 = 10;
+        private const int GmemLogProbes = 8;
+
+        // nxnative: a global memory access whose address the search traced to no storage buffer, an address the shader loaded from memory (Donkey Kong Bananza: gsys's vertex
+        // shader that resets the terrain's indirect draw records reads each record's address from a storage buffer). Ryujinx drops such an access (a load reads 0). Here it
+        // goes to the address itself: a branchless binary search finds the host's pool holding it, the address moves by that pool's delta (its Metal GPU address minus its
+        // guest address) and is accessed through a physical storage buffer pointer. An address in no pool is still dropped
+        private static bool TryGenerateRawStorageOp(
+            GtsContext gtsContext,
+            ResourceManager resourceManager,
+            IGpuAccessor gpuAccessor,
+            Operation operation,
+            out int functionId)
+        {
+            functionId = 0;
+
+            bool isSmall = IsSmallInt(operation.StorageKind);
+
+            if (isSmall && operation.Inst.IsAtomic())
+            {
+                gpuAccessor.Log($"Global memory operation \"{operation.Inst}\" on a small integer traced to no storage buffer: not implemented.");
+                return false;
+            }
+
+            if (!resourceManager.TryGetStorageBufferBinding(GmemMapCbSlot, 0, write: false, out int mapBinding))
+            {
+                return false;
+            }
+
+            bool writes = operation.Inst == Instruction.Store || operation.Inst.IsAtomic();
+            int logBinding = 0;
+
+            if (writes && !resourceManager.TryGetStorageBufferBinding(GmemMapCbSlot, GmemLogCbOffset, write: true, out logBinding))
+            {
+                return false;
+            }
+
+            resourceManager.Properties.UsesPhysicalPointers = true;
+
+            int inArgumentsCount = 2;
+
+            if (operation.Inst == Instruction.AtomicCompareAndSwap)
+            {
+                inArgumentsCount = 4;
+            }
+            else if (operation.Inst == Instruction.Store || operation.Inst.IsAtomic())
+            {
+                inArgumentsCount = 3;
+            }
+
+            EmitterContext context = new();
+
+            Operand addrLow = Argument(0);
+            Operand addrHigh = Argument(1);
+
+            Operand MapWord(Operand entry, int word)
+            {
+                return context.Load(StorageKind.StorageBuffer, mapBinding, Const(0), context.IAdd(entry, Const(word)));
+            }
+
+            // The last entry whose start is at or below the address (entry 0 starts at 0, so there always is one)
+            Operand index = Const(0);
+
+            for (int step = 1 << (GmemMapLog2 - 1); step != 0; step >>= 1)
+            {
+                Operand candidate = context.IAdd(index, Const(step));
+                Operand entry = context.IMultiply(candidate, Const(GmemMapEntryWords));
+                Operand startLow = MapWord(entry, 0);
+                Operand startHigh = MapWord(entry, 1);
+
+                Operand atOrBelow = context.BitwiseOr(
+                    context.ICompareLessUnsigned(startHigh, addrHigh),
+                    context.BitwiseAnd(context.ICompareEqual(startHigh, addrHigh), context.ICompareLessOrEqualUnsigned(startLow, addrLow)));
+
+                index = context.ConditionalSelect(atOrBelow, candidate, index);
+            }
+
+            Operand found = context.IMultiply(index, Const(GmemMapEntryWords));
+            Operand endLow = MapWord(found, 2);
+            Operand endHigh = MapWord(found, 3);
+
+            Operand inPool = context.BitwiseOr(
+                context.ICompareLessUnsigned(addrHigh, endHigh),
+                context.BitwiseAnd(context.ICompareEqual(addrHigh, endHigh), context.ICompareLessUnsigned(addrLow, endLow)));
+
+            Operand lblSkip = Label();
+            context.BranchIfFalse(lblSkip, inPool);
+
+            if (writes)
+            {
+                // A page in a pool is never 0 (the guest's first page is not mapped), so 0 marks an empty slot
+                Operand page = context.BitwiseOr(context.ShiftLeft(addrHigh, Const(20)), context.ShiftRightU32(addrLow, Const(12)));
+                Operand hash = context.ShiftRightU32(context.IMultiply(page, Const(unchecked((int)0x9e3779b1))), Const(32 - GmemLogLog2));
+
+                Operand lblLogged = Label();
+
+                for (int probe = 0; probe < GmemLogProbes; probe++)
+                {
+                    Operand slot = context.IAdd(context.BitwiseAnd(context.IAdd(hash, Const(probe)), Const((1 << GmemLogLog2) - 1)), Const(1));
+                    Operand old = context.AtomicCompareAndSwap(StorageKind.StorageBuffer, logBinding, Const(0), slot, Const(0), page);
+                    context.BranchIfTrue(lblLogged, context.BitwiseOr(context.ICompareEqual(old, Const(0)), context.ICompareEqual(old, page)));
+                }
+
+                context.Store(StorageKind.StorageBuffer, logBinding, Const(0), Const(0), Const(1));
+                context.MarkLabel(lblLogged);
+            }
+
+            // A small integer is read or written in its 32-bit word
+            Operand wordLow = isSmall ? context.BitwiseAnd(addrLow, Const(~3)) : addrLow;
+            Operand hostLow = context.IAdd(wordLow, MapWord(found, 4));
+            Operand carry = context.ConditionalSelect(context.ICompareLessUnsigned(hostLow, wordLow), Const(1), Const(0));
+            Operand hostHigh = context.IAdd(context.IAdd(addrHigh, MapWord(found, 5)), carry);
+
+            Operand resultValue = null;
+
+            if (operation.Inst == Instruction.Load)
+            {
+                resultValue = context.Load(StorageKind.GlobalMemory, hostLow, hostHigh);
+
+                if (isSmall)
+                {
+                    Operand bitOffset = HelperFunctionManager.GetBitOffset(context, addrLow);
+
+                    resultValue = operation.StorageKind switch
+                    {
+                        StorageKind.GlobalMemoryS8 => context.BitfieldExtractS32(context.ShiftRightS32(resultValue, bitOffset), Const(0), Const(8)),
+                        StorageKind.GlobalMemoryS16 => context.BitfieldExtractS32(context.ShiftRightS32(resultValue, bitOffset), Const(0), Const(16)),
+                        StorageKind.GlobalMemoryU8 => context.BitwiseAnd(context.ShiftRightU32(resultValue, bitOffset), Const(byte.MaxValue)),
+                        _ => context.BitwiseAnd(context.ShiftRightU32(resultValue, bitOffset), Const(ushort.MaxValue)),
+                    };
+                }
+            }
+            else if (operation.Inst == Instruction.Store)
+            {
+                Operand value = Argument(2);
+
+                if (isSmall)
+                {
+                    int bitSize = operation.StorageKind is StorageKind.GlobalMemoryS8 or StorageKind.GlobalMemoryU8 ? 8 : 16;
+                    Operand bitOffset = HelperFunctionManager.GetBitOffset(context, addrLow);
+
+                    Operand lblLoopHead = Label();
+                    context.MarkLabel(lblLoopHead);
+
+                    Operand oldValue = context.Load(StorageKind.GlobalMemory, hostLow, hostHigh);
+                    Operand newValue = context.BitfieldInsert(oldValue, value, bitOffset, Const(bitSize));
+                    Operand casResult = context.AtomicCompareAndSwap(StorageKind.GlobalMemory, hostLow, hostHigh, oldValue, newValue);
+
+                    context.BranchIfTrue(lblLoopHead, context.ICompareNotEqual(casResult, oldValue));
+                }
+                else
+                {
+                    context.Store(StorageKind.GlobalMemory, hostLow, hostHigh, value);
+                }
+            }
+            else if (operation.Inst == Instruction.AtomicCompareAndSwap)
+            {
+                resultValue = context.AtomicCompareAndSwap(StorageKind.GlobalMemory, hostLow, hostHigh, Argument(2), Argument(3));
+            }
+            else
+            {
+                resultValue = context.Add(operation.Inst, StorageKind.GlobalMemory, Local(), hostLow, hostHigh, Argument(2));
+            }
+
+            if (resultValue != null)
+            {
+                context.Return(resultValue);
+            }
+            else
+            {
+                context.Return();
+            }
+
+            context.MarkLabel(lblSkip);
+
+            bool returnsValue = operation.Dest != null;
+
+            if (returnsValue)
+            {
+                context.Return(Const(0));
+            }
+            else
+            {
+                context.Return();
+            }
+
+            Function function = new(
+                ControlFlowGraph.Create(context.GetOperations()).Blocks,
+                GetFunctionName(operation, isMultiTarget: true, []) + "Raw",
+                returnsValue,
+                inArgumentsCount,
+                0);
+
+            functionId = gtsContext.AddFunction(operation, isMultiTarget: true, [], function);
 
             return true;
         }
@@ -1045,6 +1301,15 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
             // If both are constant buffer, give preference to the second operand,
             // because constant buffer are always encoded as the second operand,
             // so the second operand will always be the one from the last instruction.
+            // Unless only the first is from the driver reserved buffer: Ampere code adds uniform registers
+            // (Donkey Kong Bananza's effect compute shaders: c0 storage entry + offset from c1, by UIMAD.WIDE),
+            // and the IR keeps the order of their sources.
+
+            if (src1.Type == OperandType.ConstantBuffer && src2.Type == OperandType.ConstantBuffer &&
+                src1.GetCbufSlot() == DriverReservedCb && src2.GetCbufSlot() != DriverReservedCb)
+            {
+                return GetBaseAddressCbWithOffset(src1, src2, constOffset);
+            }
 
             if (src1.Type != OperandType.ConstantBuffer ||
                 (src1.Type == OperandType.ConstantBuffer && src2.Type == OperandType.ConstantBuffer) ||

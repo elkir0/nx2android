@@ -1,6 +1,8 @@
 # Game Freak's Trinity engine file system (Pokémon Legends: Z-A): arc/data.trpfs (packs of files) with arc/data.trpfd as its index, both FlatBuffers. Read by the shader split
 # (shader_split.py trpfs_jobs, trinity_shaders) and by the porter, which has the packs' Oodle files decoded by the game's own decoder on the Android device (porter/pipeline.py device_oodle)
-import mmap, os, struct
+import os as _os, struct, sys
+sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), '../../tools'))
+from romfs import mmap, open, os   # noqa: E402  a .trpfs inside a RomFS image (extract/v<version>/RomFS.img) is read in place, as the split reads every RomFS file
 
 ONEPACK = b'ONEPACK\0'
 
@@ -32,7 +34,8 @@ def packs(p):
     if not p.endswith('.trpfs') or not os.path.exists(p[:-1] + 'd'): return None
     with open(p, 'rb') as f:
         if f.read(8) != ONEPACK: return None
-    fd = open(p[:-1] + 'd', 'rb').read(); fr = fb_root(fd)
+    with open(p[:-1] + 'd', 'rb') as f: fd = f.read()
+    fr = fb_root(fd)
     hashes = struct.unpack_from(f'<{fb_vec(fd, fr, 0)[1]}Q', fd, fb_vec(fd, fr, 0)[0])
     names = [fd[s + 4:s + 4 + struct.unpack_from('<I', fd, s)[0]].decode() for s in fb_refs(fd, fr, 1)]
     pack_of = {h: struct.unpack_from('<Q', fd, fb_field(fd, t, 0))[0] if fb_field(fd, t, 0) is not None else 0 for h, t in zip(hashes, fb_refs(fd, fr, 2))}

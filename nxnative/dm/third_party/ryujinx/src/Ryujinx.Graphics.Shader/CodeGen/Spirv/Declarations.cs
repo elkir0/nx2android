@@ -46,7 +46,15 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
             DeclareConstantBuffers(context, context.Properties.ConstantBuffers.Values);
             DeclareStorageBuffers(context, context.Properties.StorageBuffers.Values);
             DeclareMemories(context, context.Properties.LocalMemories, context.LocalMemories, StorageClass.Private);
-            DeclareMemories(context, context.Properties.SharedMemories, context.SharedMemories, StorageClass.Workgroup);
+            // nx2android: past the host's limit, in a storage buffer (SharedMemorySpill)
+            if (SharedMemorySpill.IsOn(context))
+            {
+                SharedMemorySpill.Declare(context);
+            }
+            else
+            {
+                DeclareMemories(context, context.Properties.SharedMemories, context.SharedMemories, StorageClass.Workgroup);
+            }
             DeclareSamplers(context, context.Properties.Textures.Values);
             DeclareImages(context, context.Properties.Images.Values);
             DeclareInputsAndOutputs(context, info);
@@ -127,7 +135,8 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
 
                 if (decoratedTypes.Add(structType))
                 {
-                    context.Decorate(structType, isBuffer ? Decoration.BufferBlock : Decoration.Block);
+                    // nx2android: a SPIR-V 1.4 module has no BufferBlock: its storage buffers are Block structures in the StorageBuffer storage class (CodeGenContext.StorageBufferClass)
+                    context.Decorate(structType, isBuffer && context.StorageBufferClass == StorageClass.Uniform ? Decoration.BufferBlock : Decoration.Block);
 
                     for (int fieldIndex = 0; fieldIndex < structFieldOffsets.Length; fieldIndex++)
                     {
@@ -135,8 +144,9 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
                     }
                 }
 
-                SpvInstruction pointerType = context.TypePointer(StorageClass.Uniform, structType);
-                SpvInstruction variable = context.Variable(pointerType, StorageClass.Uniform);
+                StorageClass storageClass = isBuffer ? context.StorageBufferClass : StorageClass.Uniform;
+                SpvInstruction pointerType = context.TypePointer(storageClass, structType);
+                SpvInstruction variable = context.Variable(pointerType, storageClass);
 
                 context.Name(variable, buffer.Name);
                 context.Decorate(variable, Decoration.DescriptorSet, (LiteralInteger)setIndex);

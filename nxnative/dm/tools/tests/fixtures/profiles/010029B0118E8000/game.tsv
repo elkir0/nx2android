@@ -1,0 +1,6 @@
+# Test fixture (dm/tools/tests): the rows of upstream's profile 010029B0118E8000 that shader_split.py reads; nx2android has no profile of this game
+title_id	010029B0118E8000
+program_id	010029B0118E8000
+name	Need For Speed™ Hot Pursuit Remastered
+shader_groups	/RU/=ru /EN_US/=enus /IT/=it /DE/=de /ES/=es /FR/=fr /JA/=ja /UI/=ui /DECALLIBRARY/=decallibrary /VEHICLES/=vehicles /PREMADEWRAPS/=premadewraps /SEACREST/=seacrest /GAMELOGIC/=gamelogic /SOUND/=sound /CHARACTERS/=characters /AI/=ai /ENVIRONMENT/=environment /ENVIRONMENTSETTINGS/=environmentsetti /GPGPU/=gpgpu /POSTFX/=postfx
+shader_note	Need For Speed™ Hot Pursuit Remastered shaders

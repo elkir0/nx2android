@@ -1,7 +1,8 @@
 # adb for installing a port: the device list, installing the APK, and pushing the data pack in short transfers. Big pushes over one adb connection wedge adbd on some
-# devices (a 6 GB RomFS), so small files go in batches (tar archives of up to 64 MB when there are many) and big files in 64 MB pieces that the device joins; a rerun resumes (files already at their size are skipped,
-# pieces already in place are kept). The port's own outputs are also compared by MD5: a rewriter cut changes a module without changing its size, and Unpacking's sdk cuts never
-# reached the device until they were. Pushes use -Z: compressing them took adbd down.
+# devices (a 6 GB RomFS), so small files go in batches (tar archives of up to 64 MB when there are many) and big files in 64 MB pieces, each appended on the device to the file's
+# partial copy as it arrives (a 23.5 GB RomFS image: 351 pieces, and never more than the file and one piece on the device); a rerun resumes (files already at their size are skipped,
+# a partial copy keeps its whole pieces). The port's own outputs are also compared by MD5: a rewriter cut changes a module without changing its size, and Unpacking's sdk cuts never
+# reached the device until they were; the game's files are compared by size alone. Pushes use -Z: compressing them took adbd down.
 import contextlib, hashlib, os, re, shlex, shutil, subprocess, tarfile, tempfile, time
 from pathlib import Path
 
@@ -259,19 +260,29 @@ class Adb:
         return done
 
     def push_file(self, local, dst, chunk=64 << 20, progress=None):
-        """One file in pieces of chunk bytes, joined on the device; pieces already there are kept, so an interrupted push resumes. progress(done, size, note)"""
-        local = Path(local); size = local.stat().st_size; n = max(1, (size + chunk - 1) // chunk)
-        pdir = f'{os.path.dirname(dst)}/.dmpart-{hashlib.sha1(dst.encode()).hexdigest()[:12]}'   # one piece folder per file: a resumed push finds its own pieces
-        self.shell(f'mkdir -p {shlex.quote(pdir)}'); pieces = self.remote_sizes(pdir)
+        """One file in pieces of chunk bytes. Each piece is pushed beside dst and appended at once to dst's partial copy (a hidden .dmpart-* file named after dst and the local file's
+        size and time), which is renamed to dst when whole: the device holds the file and one piece at most, never the pieces and their join (twice a 23.5 GB image). An interrupted
+        push resumes after the whole pieces its partial copy holds (cut back to them: an append may have stopped part-way); a partial copy of another local file is removed.
+        The sizes go through Python: Android's shell computes in 32 bits. progress(done, size, note)"""
+        local = Path(local); st = local.stat(); size = st.st_size; n = max(1, (size + chunk - 1) // chunk)
+        d, tag = os.path.dirname(dst), hashlib.sha1(dst.encode()).hexdigest()[:12]
+        part = f'{d}/.dmpart-{tag}-{hashlib.sha1(f"{size}:{st.st_mtime_ns}".encode()).hexdigest()[:8]}'; piece = f'{part}.piece'
+        q, qp, qc = shlex.quote(dst), shlex.quote(part), shlex.quote(piece)
+        # the folder of an earlier layout's pieces (.dmpart-<tag>/) and a partial copy of another local file go; what the partial copy holds stays
+        out = self.shell(f'mkdir -p {shlex.quote(d)} && cd {shlex.quote(d)} && for x in .dmpart-{tag} .dmpart-{tag}-*; do [ -e "$x" ] && [ "$x" != {shlex.quote(os.path.basename(part))} ] && '
+                         f'rm -rf "$x"; done; rm -f {qc}; stat -c %s {qp} 2>/dev/null || echo none').split()
+        have = int(out[-1]) if out and out[-1].isdigit() else None   # None: no partial copy
+        k0 = 0 if have is None else n if have == size else min(have // chunk, n - 1)   # the pieces in place: all of a whole copy, else the whole ones
+        if have is not None and k0 < n and have != k0 * chunk: self.shell(f'truncate -s {k0 * chunk} {qp}')
+        if k0: self.log(f'{local.name}: resuming after {k0} of {n} pieces on the device')
         with tempfile.TemporaryDirectory(prefix='nx2a_push_') as t, open(local, 'rb') as f:
-            for k in range(n):
-                want, name = min(chunk, size - k * chunk), f'{k:05d}'
-                if pieces.get(name) != want:
-                    tmp = Path(t) / 'piece.bin'
-                    f.seek(k * chunk); tmp.write_bytes(f.read(want))
-                    self.run('push', '-Z', tmp, f'{pdir}/{name}', timeout=max(self.timeout, 600))
+            for k in range(k0, n):
+                want = min(chunk, size - k * chunk)
+                tmp = Path(t) / 'piece.bin'
+                f.seek(k * chunk); tmp.write_bytes(f.read(want))
+                self.run('push', '-Z', tmp, piece, timeout=max(self.timeout, 600))
+                got = self.shell(f'cat {qc} >> {qp} && rm -f {qc} && stat -c %s {qp}', timeout=max(self.timeout, 600)).strip()
+                if got != str(k * chunk + want): raise AdbError(f'{local.name}: piece {k + 1}/{n} left {got or "no"} bytes on the device, expected {k * chunk + want}')
                 if progress: progress(k * chunk + want, size, f'{local.name} piece {k + 1}/{n}')
-        q, qp = shlex.quote(dst), shlex.quote(pdir)   # join the pieces in order, then check the size
-        self.shell(f'rm -f {q} && for x in $(ls {qp} | sort); do cat {qp}/$x >> {q} || exit 1; done && rm -rf {qp}', timeout=1200)
-        got = self.shell(f'stat -c %s {q}').strip()
+        got = self.shell(f'mv -f {qp} {q} && stat -c %s {q}').strip()
         if got != str(size): raise AdbError(f'{local.name}: {got} bytes on the device, expected {size}')

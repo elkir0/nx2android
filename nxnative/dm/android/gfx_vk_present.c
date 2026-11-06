@@ -3,6 +3,7 @@
 // presented with FIFO (vsync) pacing. Headless (dmhost from adb shell): frames are counted, and DM_VK_SHOT=n1,n2,... writes those presented frames as PPM files to
 // DM_VK_SHOT_DIR (default DM_ROOT), which is how a run without a screen is checked.
 #include "gfx_vk.h"
+#include "gfx_vk_fsr.h"
 #include <android/native_window.h>
 #include <string.h>
 #include <math.h>
@@ -48,9 +49,17 @@ static double present_time_get(uint64_t ticket) {
     return t;
 }
 static VkSurfaceKHR g_surf; static VkSwapchainKHR g_swap; static VkImage g_simg[8]; static uint32_t g_nsimg; static VkExtent2D g_sext; static VkFormat g_sfmt;
+// The window (g_lext: what the game's picture, the overlay and the touches are laid out in) and the swapchain image (g_sext): the same, or turned when the swapchain is
+// pre-rotated (g_rot, VKFSR_ROT*: DM_VK_PRETRANSFORM). The display's transform at the swapchain's making (g_tf_now) and which ones it takes (g_tf_ok)
+static VkExtent2D g_lext; static int g_rot, g_want_rot; static uint32_t g_tf_now, g_tf_ok;
+static int rot_of(uint32_t tf) { return tf == VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR ? VKFSR_ROT90 : tf == VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR ? VKFSR_ROT180 : tf == VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR ? VKFSR_ROT270 : VKFSR_ROT0; }
+static const uint32_t ROT_TF[4] = {VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR, VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR, VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR, VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR};
+static float g_ov_rot[4] = {1, 0, 0, 1};   // the overlay's clip-space turn for g_rot (shaders/overlay.vert): ROT90 (x, y) -> (-y, x), as the picture's (gfx_vk_fsr.h)
 // The swapchain's format follows the window texture's sRGB-ness: a blit from an sRGB image into a UNORM one decodes to linear and stores that unencoded, which darkened the whole
 // picture (Donkey Kong Country Returns HD presents RGBA8_SRGB, NVN format 0x38; issue #4). The Switch scans the window texture's bytes out as they are, and an SRGB -> SRGB blit
-// decodes and encodes them again. UNORM games keep the UNORM swapchain. The overlay drawn after the blit is encoded too in an sRGB swapchain, so it shows a little lighter there
+// decodes and encodes them again. UNORM games keep the UNORM swapchain. The overlay drawn after the blit is encoded too in an sRGB swapchain, so it shows a little lighter there.
+// That is the blit's rule (DM_VK_UPSCALE=off): the upscaling passes (gfx_vk_fsr.c) read the bytes through a UNORM view and write them unchanged into a UNORM swapchain for
+// every game, the overlay's colours as they are made
 static VkFormat g_want = VK_FORMAT_R8G8B8A8_UNORM;
 static VkSemaphore g_acq[8], g_done_sem[8]; static VkFence g_pfence[8]; static VkCommandPool g_ppool; static VkCommandBuffer g_pcb[8]; static uint32_t g_pi;
 static ANativeWindow *g_win;
@@ -93,15 +102,30 @@ static int swap_make(void) {
     g_sfmt = sf[0].format; for (uint32_t i = 0; i < nf; i++) if (sf[i].format == VK_FORMAT_R8G8B8A8_UNORM) g_sfmt = sf[i].format;
     for (uint32_t i = 0; i < nf; i++) if (sf[i].format == g_want) g_sfmt = g_want;   // the window texture's sRGB-ness (g_want), so the blit copies its bytes as they are
     if (g_sfmt != g_want) VKRED_ONCE(95, "the surface offers no format %d for the window texture: its picture is %s", g_want, g_want == VK_FORMAT_R8G8B8A8_SRGB ? "darker" : "lighter");
-    g_sext = (VkExtent2D){(uint32_t)ANativeWindow_getWidth(w), (uint32_t)ANativeWindow_getHeight(w)};   // the window as it is now; Android's compositor rotates (identity transform)
-    if (!g_sext.width || !g_sext.height) g_sext = caps.currentExtent;
+    g_lext = (VkExtent2D){(uint32_t)ANativeWindow_getWidth(w), (uint32_t)ANativeWindow_getHeight(w)};   // the window as it is now
+    if (!g_lext.width || !g_lext.height) g_lext = caps.currentExtent;
+    // Pre-rotation (DM_VK_PRETRANSFORM=1, live; off by default until a device run has checked the turn's direction on screen): where the display is turned from its natural
+    // orientation (a landscape game on a panel scanned in portrait: the Fold 8's outer screen, likely its inner one too) a swapchain made IDENTITY leaves the turn to the
+    // compositor every frame (Android answers VK_SUBOPTIMAL_KHR to such presents: counted below), with the display hardware where it can turn the layer and the GPU where it
+    // cannot. Made in the display's transform instead, the image holds the picture turned (the upscaling passes and the overlay draw it so: gfx_vk_fsr.h, shaders/overlay.vert)
+    // and the compositor shows it as it is. Only the upscaling passes can turn the picture (vkCmdBlitImage cannot): the blit keeps IDENTITY (g_want_rot, present_window)
+    g_tf_now = caps.currentTransform; g_tf_ok = caps.supportedTransforms;
+    g_rot = g_want_rot && (caps.supportedTransforms & caps.currentTransform) ? rot_of(caps.currentTransform) : VKFSR_ROT0;
+    g_sext = g_rot == VKFSR_ROT90 || g_rot == VKFSR_ROT270 ? (VkExtent2D){g_lext.height, g_lext.width} : g_lext;
+    { static const float R[4][4] = {{1, 0, 0, 1}, {0, 1, -1, 0}, {-1, 0, 0, -1}, {0, -1, 1, 0}}; memcpy(g_ov_rot, R[g_rot], sizeof g_ov_rot); }
     uint32_t n = caps.minImageCount < 3 ? 3 : caps.minImageCount; if (caps.maxImageCount && n > caps.maxImageCount) n = caps.maxImageCount;
     VkSwapchainCreateInfoKHR ci = {VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR, NULL, 0, g_surf, n, g_sfmt, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR, g_sext, 1,
-        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR,
+        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL, (VkSurfaceTransformFlagBitsKHR)ROT_TF[g_rot],
         (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR) ? VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR : VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, VK_PRESENT_MODE_FIFO_KHR, 1, VK_NULL_HANDLE};
     VkResult r = vkCreateSwapchainKHR(V.dev, &ci, NULL, &g_swap);
     if (r) { VKLOG("[RED] swapchain creation failed: %d", r); swap_destroy(); return 0; }
     g_nsimg = 8; vkGetSwapchainImagesKHR(V.dev, g_swap, &g_nsimg, g_simg);
+    // the surface as the device reports it, once a swapchain: whether its image could be a storage image (gfx_vk_fsr.c draws with fragment passes either way), and the
+    // display's transform: with ROTATE_90 / 270 current and IDENTITY made, the compositor turns every frame (Android answers such presents VK_SUBOPTIMAL_KHR, below)
+    { uint32_t npm = 0; vkGetPhysicalDeviceSurfacePresentModesKHR(V.pd, g_surf, &npm, NULL);
+      VKLOG("surface: transform now %#x (supported %#x, the swapchain's %#x), usages %#x, composite alpha %#x, %u present modes, %u-%u images, extent now %ux%u",
+            caps.currentTransform, caps.supportedTransforms, ROT_TF[g_rot], caps.supportedUsageFlags, caps.supportedCompositeAlpha, npm,
+            caps.minImageCount, caps.maxImageCount, caps.currentExtent.width, caps.currentExtent.height); }
     for (uint32_t i = 0; i < g_nsimg; i++) { VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, g_simg[i], VK_IMAGE_VIEW_TYPE_2D, g_sfmt, {0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
         VKCHK(vkCreateImageView(V.dev, &vi, NULL, &g_sview[i])); }
     if (!g_ppool) {
@@ -112,7 +136,7 @@ static int swap_make(void) {
             VkFenceCreateInfo f = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, NULL, VK_FENCE_CREATE_SIGNALED_BIT}; VKCHK(vkCreateFence(V.dev, &f, NULL, &g_pfence[i]));
         }
     }
-    VKLOG("swapchain %ux%u format %d, %u images", g_sext.width, g_sext.height, g_sfmt, g_nsimg);
+    VKLOG("swapchain %ux%u format %d, %u images%s", g_sext.width, g_sext.height, g_sfmt, g_nsimg, g_rot ? (g_rot == VKFSR_ROT90 ? ", pre-rotated 90" : g_rot == VKFSR_ROT180 ? ", pre-rotated 180" : ", pre-rotated 270") : "");
     return 1;
 }
 static void barrier(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkImageLayout to) {
@@ -351,7 +375,7 @@ static void ov_menu_panel(const ov_canvas *cv, int st) {
 // The layout editor's toolbar and prompt (overlay_layout.h ov_ed_*), at half the window's scale in the raster's panel rectangle: the toolbar at its top, the
 // prompt under it (gfx_vk_present.c ov_render draws each where overlay_layout.h puts it)
 static void ov_ed_rects(float tb[4], float pr[4]) {   // their places in the raster
-    float W = (float)g_sext.width, H = (float)g_sext.height, a[4], b[4]; ov_ed_rect(W, H, a); ov_ed_prompt_rect(W, H, b);
+    float W = (float)g_lext.width, H = (float)g_lext.height, a[4], b[4]; ov_ed_rect(W, H, a); ov_ed_prompt_rect(W, H, b);
     tb[0] = 0; tb[1] = 0; tb[2] = fminf(a[2] / 2, (float)g_ov.pw); tb[3] = a[3] / 2;
     pr[0] = 0; pr[1] = tb[3] + 2; pr[2] = fminf(b[2] / 2, (float)g_ov.pw); pr[3] = fminf(b[3] / 2, (float)g_ov.ph - pr[1]);
 }
@@ -432,10 +456,10 @@ static void ov_raster(uint8_t *px, uint32_t w, uint32_t h, uint32_t sh) {
         else ov_circle(px, w, h + sh, x, y, r, 2.5f);
     }
 }
-typedef struct { float pos[4], uv[4], alpha; } ov_quad;
-static void ov_draw(VkCommandBuffer cb, const ov_quad *q) { vkCmdPushConstants(cb, g_ov.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof *q, q); vkCmdDraw(cb, 6, 1, 0, 0); }
+typedef struct { float pos[4], uv[4], alpha, pad[3], rot[4]; } ov_quad;   // (shaders/overlay.vert's push constants: rot at 48)
+static void ov_draw(VkCommandBuffer cb, const ov_quad *q) { ov_quad r = *q; memcpy(r.rot, g_ov_rot, sizeof r.rot); vkCmdPushConstants(cb, g_ov.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof r, &r); vkCmdDraw(cb, 6, 1, 0, 0); }
 static void ov_rect(VkCommandBuffer cb, float x0, float y0, float x1, float y1, float u0, float v0, float u1, float v1, float alpha) {   // screen pixels, texels
-    float W = (float)g_sext.width, H = (float)g_sext.height, tw = (float)g_ov.w, th = (float)(g_ov.h + g_ov.sh + g_ov.ph + g_ov.gh);
+    float W = (float)g_lext.width, H = (float)g_lext.height, tw = (float)g_ov.w, th = (float)(g_ov.h + g_ov.sh + g_ov.ph + g_ov.gh);
     ov_quad q = {{x0 / W * 2 - 1, y0 / H * 2 - 1, x1 / W * 2 - 1, y1 / H * 2 - 1}, {u0 / tw, v0 / th, u1 / tw, v1 / th}, alpha}; ov_draw(cb, &q);
 }
 static void ov_sprite(VkCommandBuffer cb, int i, float sx, float sy, float r, float alpha) {   // sprite i centred on screen pixel (sx, sy), r screen pixels in half width
@@ -446,7 +470,7 @@ static void ov_sprite(VkCommandBuffer cb, int i, float sx, float sy, float r, fl
 // offset from its control's centre. Decorations first, then each control in the table's order: a held button, d-pad direction or stick in its held sprite,
 // a stick's knob where the finger has it (as far as the design lets it travel); the menu button last (ov_theme_menu), over everything
 static void ov_tsp(VkCommandBuffer cb, const ov_theme *t, const ov_tsprite *s, float cx, float cy, float k, float alpha) {
-    float W = (float)g_sext.width, H = (float)g_sext.height, x0 = cx + s->ox * k, y0 = cy + s->oy * k, x1 = x0 + s->w / t->scale * k, y1 = y0 + s->h / t->scale * k;
+    float W = (float)g_lext.width, H = (float)g_lext.height, x0 = cx + s->ox * k, y0 = cy + s->oy * k, x1 = x0 + s->w / t->scale * k, y1 = y0 + s->h / t->scale * k;
     ov_quad q = {{x0 / W * 2 - 1, y0 / H * 2 - 1, x1 / W * 2 - 1, y1 / H * 2 - 1}, {s->u / t->w, s->v / t->h, (s->u + s->w) / t->w, (s->v + s->h) / t->h}, alpha}; ov_draw(cb, &q);
 }
 static float ov_glow(int64_t t, int64_t now) {   // a held button's glow: bright at the press, fading to a steady one
@@ -465,7 +489,7 @@ static void ov_fps(VkCommandBuffer cb, int64_t now) {
     if (!t0 || now - t0 > 2000000000ll) { t0 = now; n0 = n; fps = -1; }   // the first frame, or after a pause in the presents (the menu, the background): measure anew
     else if (now - t0 >= 500000000ll) { fps = (int)((double)(n - n0) * 1e9 / (double)(now - t0) + 0.5); t0 = now; n0 = n; }
     char s[16]; if (fps < 0) snprintf(s, sizeof s, "-- FPS"); else snprintf(s, sizeof s, "%d FPS", fps > 999 ? 999 : fps);
-    float k = (float)g_sext.width / g_ov.w, cw = ov_fps_cell() * k, ch = (float)g_ov.gh * k, m = (float)g_sext.height * 0.02f, x = m + ch * 0.25f, pad = ch * 0.2f;
+    float k = (float)g_lext.width / g_ov.w, cw = ov_fps_cell() * k, ch = (float)g_ov.gh * k, m = (float)g_lext.height * 0.02f, x = m + ch * 0.25f, pad = ch * 0.2f;
     float bx = g_ov.sp[SP_BLACK][0], by = g_ov.sp[SP_BLACK][1], gy = (float)(g_ov.h + g_ov.sh + g_ov.ph);
     ov_rect(cb, m, m, m + ch * 0.5f + strlen(s) * cw, m + ch + 2 * pad, bx - 2, by - 2, bx + 2, by + 2, 0.45f);
     for (int i = 0; s[i]; i++, x += cw) {
@@ -474,7 +498,7 @@ static void ov_fps(VkCommandBuffer cb, int64_t now) {
     }
 }
 static void ov_theme_draw(VkCommandBuffer cb, const ov_theme *t, float alpha) {   // (alpha: the player's opacity; each control at its own size factor)
-    float W = (float)g_sext.width, H = (float)g_sext.height, k = H / t->dh * dm_overlay_scale(), b[4]; const ov_ctl *L = OV_LAYOUTS[t->layout];
+    float W = (float)g_lext.width, H = (float)g_lext.height, k = H / t->dh * dm_overlay_scale(), b[4]; const ov_ctl *L = OV_LAYOUTS[t->layout];
     for (int j = 0; j < t->n; j++) if (t->sp[j].state == OVT_DECOR) { const ov_ctl *c = &L[t->sp[j].ctl]; ov_box(c, W, H, b); ov_tsp(cb, t, &t->sp[j], b[0], b[1], k * ov_cscale(c), alpha); }
     for (int i = 0; i < OV_N; i++) {
         const ov_ctl *c = &L[i]; if (c->kind == OV_MENU) continue;
@@ -489,7 +513,7 @@ static void ov_theme_draw(VkCommandBuffer cb, const ov_theme *t, float alpha) { 
     }
 }
 static void ov_theme_menu(VkCommandBuffer cb, const ov_theme *t, int i, float alpha) {
-    const ov_ctl *c = &OV_LAYOUTS[t->layout][i]; float W = (float)g_sext.width, H = (float)g_sext.height, b[4]; ov_box(c, W, H, b);
+    const ov_ctl *c = &OV_LAYOUTS[t->layout][i]; float W = (float)g_lext.width, H = (float)g_lext.height, b[4]; ov_box(c, W, H, b);
     int held = dm_overlay_pressed(i, 0) != 0;
     for (int j = 0; j < t->n; j++) if (t->sp[j].ctl == i && t->sp[j].state == (held ? OVT_HELD : OVT_IDLE)) ov_tsp(cb, t, &t->sp[j], b[0], b[1], H / t->dh * dm_overlay_scale() * ov_cscale(c), alpha);
 }
@@ -501,7 +525,7 @@ static void ov_frame(VkCommandBuffer cb, int sp, const float b[4], float t, floa
     ov_block(cb, sp, x0, y0, x1, y0 + t, alpha); ov_block(cb, sp, x0, y1 - t, x1, y1, alpha); ov_block(cb, sp, x0, y0 + t, x0 + t, y1 - t, alpha); ov_block(cb, sp, x1 - t, y0 + t, x1, y1 - t, alpha);
 }
 static void ov_render(VkCommandBuffer cb, int mode, int menu, int fps) {
-    float W = (float)g_sext.width, H = (float)g_sext.height, op = dm_overlay_opacity();
+    float W = (float)g_lext.width, H = (float)g_lext.height, op = dm_overlay_opacity();
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); int64_t now = (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
     int edit = menu >= 0 && !(menu >> 16 & 1) && (menu & OVE_ST);   // the layout editor: the gamepad over the held frame, every control (shown or not)
     if (edit) mode = 1;
@@ -595,7 +619,7 @@ static void ov_theme_upload(VkCommandBuffer cb, uint32_t k, int lay) {
     T->t = t; T->upk = k; T->ready = 1;
 }
 static int overlay_ready(VkCommandBuffer cb, uint32_t k, int menu) {   // k: this present's slot (its fence is not signalled yet)
-    uint32_t w = g_sext.width / 2, h = g_sext.height / 2; int lay = dm_overlay_layout();
+    uint32_t w = g_lext.width / 2, h = g_lext.height / 2; int lay = dm_overlay_layout();
     if (!g_ov.dsl) {
         VkDescriptorSetLayoutBinding b = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL};
         VkDescriptorSetLayoutCreateInfo li = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, 0, 1, &b}; VKCHK(vkCreateDescriptorSetLayout(V.dev, &li, NULL, &g_ov.dsl));
@@ -637,7 +661,7 @@ static int overlay_ready(VkCommandBuffer cb, uint32_t k, int menu) {   // k: thi
         g_ov.cver = dm_overlay_custom_ver();   // (and, without a theme, the player's own layout: the outlines are in the static layer)
         vkDeviceWaitIdle(V.dev);
         if (g_ov.view) { vkDestroyImageView(V.dev, g_ov.view, NULL); vkDestroyImage(V.dev, g_ov.img, NULL); vkFreeMemory(V.dev, g_ov.mem, NULL); vkDestroyBuffer(V.dev, g_ov.up, NULL); vkFreeMemory(V.dev, g_ov.upm, NULL); }
-        g_ov.lay = lay; uint32_t sh = ov_layout_sprites(w, h); float mr[4]; ov_menu_rect((float)g_sext.width, (float)g_sext.height, mr);
+        g_ov.lay = lay; uint32_t sh = ov_layout_sprites(w, h); float mr[4]; ov_menu_rect((float)g_lext.width, (float)g_lext.height, mr);
         g_ov.pw = (uint32_t)(mr[2] / 2) + 1; g_ov.ph = (uint32_t)(mr[3] / 2) + 1; if (g_ov.pw > w) g_ov.pw = w;
         g_ov.gs = (uint32_t)fmaxf(2, roundf(h * 0.035f / 7)); g_ov.gh = 7 * g_ov.gs + 4;   // the counter's characters: 3.5% of the window's height
         uint32_t th = h + sh + g_ov.ph + g_ov.gh;
@@ -699,7 +723,9 @@ static uint64_t pace_desired(double period) {   // the frame's desired present t
     if (!g_refresh_ns || g_pace_n % 120 == 0) {
         VkRefreshCycleDurationGOOGLE rc; uint64_t was = g_refresh_ns;
         if (vkGetRefreshCycleDurationGOOGLE(V.dev, g_swap, &rc) == VK_SUCCESS && rc.refreshDuration > 1000000) g_refresh_ns = rc.refreshDuration;
-        if (g_refresh_ns && g_refresh_ns != was) { VKLOG("[perf] display timing: refresh %.3f ms", g_refresh_ns / 1e6); g_pace_target = 0; }
+        // a new display rate restarts the cadence; the Fold 8's 240 Hz panel reports its period anew within 4.146-4.171 ms (run 13: 30-odd such lines in a race, each
+        // restarting the cadence, one irregular frame each): a change under 5 % is taken without a restart
+        if (g_refresh_ns && (!was || (g_refresh_ns > was ? g_refresh_ns - was : was - g_refresh_ns) * 20 > was)) { VKLOG("[perf] display timing: refresh %.3f ms", g_refresh_ns / 1e6); g_pace_target = 0; }
     }
     VkPastPresentationTimingGOOGLE pt[16]; uint32_t np = 16;
     if (vkGetPastPresentationTimingGOOGLE(V.dev, g_swap, &np, pt) >= 0)
@@ -721,51 +747,77 @@ static uint64_t pace_desired(double period) {   // the frame's desired present t
     g_pace_target = t;
     return t - g_refresh_ns / 2;
 }
+static void ov_draw_all(VkCommandBuffer cb, int ovm, int menu, int fps) {   // the overlay into the rendering scope open on the swapchain image
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_ov.pipe);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_ov.layout, 0, 1, &g_ov.set, 0, NULL);
+    VkViewport vp = {0, 0, (float)g_sext.width, (float)g_sext.height, 0, 1}; VkRect2D sc = {{0, 0}, g_sext};
+    vkCmdSetViewport(cb, 0, 1, &vp); vkCmdSetScissor(cb, 0, 1, &sc);
+    ov_render(cb, ovm, menu, fps);
+}
+static int is_srgb(VkFormat f) { return f == VK_FORMAT_R8G8B8A8_SRGB || f == VK_FORMAT_B8G8R8A8_SRGB || f == VK_FORMAT_A8B8G8R8_SRGB_PACK32; }
 static void present_window(vkimg_t *im, const int crop[4], double period, uint64_t ticket) {   // period: the game's frame period (s); < 0 for a redraw (ticket 0)
     uint32_t k = g_pi++ % 8;
     vkWaitForFences(V.dev, 1, &g_pfence[k], 1, UINT64_MAX);
-    VkFormat want = im->fmt == VK_FORMAT_R8G8B8A8_SRGB || im->fmt == VK_FORMAT_B8G8R8A8_SRGB || im->fmt == VK_FORMAT_A8B8G8R8_SRGB_PACK32 ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
-    if (want != g_want) { g_want = want; swap_destroy(); if (!swap_make()) return; }   // once, at the first present of the other kind
+    vk_fsr_time_collect(k);   // (the slot's last present has run: its GPU time)
+    // What draws the picture (gfx_vk_fsr.c, DM_VK_UPSCALE): its passes read the window image's bytes through a UNORM view and write them as they are, so their swapchain is
+    // UNORM for every game; the blit (DM_VK_UPSCALE=off, or a device or image the passes cannot take) keeps the swapchain of the window texture's sRGB-ness (g_want above)
+    int path = vk_fsr_path(im, crop, (int)g_lext.width, (int)g_lext.height);
+    VkFormat want = !path && is_srgb(im->fmt) ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+    static int pre; static uint64_t polls; if (polls++ % 30 == 0) { const char *e = getenv("DM_VK_PRETRANSFORM"); pre = e && atoi(e) > 0; }
+    int wr = path && pre, rot = wr && (g_tf_ok & g_tf_now) ? rot_of(g_tf_now) : VKFSR_ROT0;   // the swapchain this present wants: its format, its turn
+    if (want != g_want || rot != g_rot) { g_want = want; g_want_rot = wr; swap_destroy(); if (!swap_make()) return; }   // once, at the first present of the other kind
+    g_want_rot = wr;
     uint32_t idx; VkResult r = vkAcquireNextImageKHR(V.dev, g_swap, UINT64_MAX, g_acq[k], VK_NULL_HANDLE, &idx);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) { swap_destroy(); if (!swap_make()) return; r = vkAcquireNextImageKHR(V.dev, g_swap, UINT64_MAX, g_acq[k], VK_NULL_HANDLE, &idx); }
     if (r < 0) { VKRED_ONCE(90, "vkAcquireNextImageKHR: %d", r); return; }
+    if (path) path = vk_fsr_path(im, crop, (int)g_lext.width, (int)g_lext.height);   // (the window may have changed size with the swapchain made again)
     vkResetFences(V.dev, 1, &g_pfence[k]);
     VkCommandBuffer cb = g_pcb[k];
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT}; vkBeginCommandBuffer(cb, &bi);
     vk_img_barrier_all(cb);   // after everything submitted before on this queue
-    barrier(cb, g_simg[idx], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    VkClearColorValue black = {{0, 0, 0, 1}}; VkImageSubresourceRange rg = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    vkCmdClearColorImage(cb, g_simg[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &rg);
-    int cx = crop ? crop[0] : 0, cy = crop ? crop[1] : 0, cw = crop && crop[2] ? crop[2] : (int)im->w, ch = crop && crop[3] ? crop[3] : (int)im->h;
-    double s = fmin((double)g_sext.width / cw, (double)g_sext.height / ch); int dw = (int)(cw * s), dh = (int)(ch * s), dx = ((int)g_sext.width - dw) / 2, dy = ((int)g_sext.height - dh) / 2;
-    vk_pic_set((float)dx / g_sext.width, (float)dy / g_sext.height, (float)dw / g_sext.width, (float)dh / g_sext.height);
-    VkImageBlit b = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{cx, cy, 0}, {cx + cw, cy + ch, 1}}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{dx, dy, 0}, {dx + dw, dy + dh, 1}}};
-    if (vk_window_bottom_up()) { b.srcOffsets[0].y = cy + ch; b.srcOffsets[1].y = cy; }   // lower-left origin: the window image is stored bottom-up (gfx_vk_exec.c)
-    vkCmdBlitImage(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, g_simg[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
-    VkImageLayout lay = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    vk_fsr_time_start(cb, k);
+    int c[4]; vkfsr_crop(crop, (int)im->w, (int)im->h, c);   // (a crop past the image's edge is cut to it)
+    vkfsr_rect pic = vkfsr_fit(c[2], c[3], (int)g_lext.width, (int)g_lext.height);
+    vk_pic_set((float)pic.x / g_lext.width, (float)pic.y / g_lext.height, (float)pic.w / g_lext.width, (float)pic.h / g_lext.height);
     int ovm = dm_overlay_visible(), menu = dm_menu_state(), fps = dm_overlay_fps();
-    if ((ovm || menu >= 0 || fps) && overlay_ready(cb, k, menu) && (V.has_dynrender || ov_fb(idx))) {   // without dynamic rendering, only with the image's framebuffer
-        barrier(cb, g_simg[idx], lay, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL); lay = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        VkRenderingAttachmentInfo ca = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, NULL, g_sview[idx], lay, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED, VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_STORE_OP_STORE};
-        VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO, NULL, 0, {{0, 0}, g_sext}, 1, 0, 1, &ca, NULL, NULL};
-        VkFramebuffer ofb = V.has_dynrender ? VK_NULL_HANDLE : ov_fb(idx);
-        if (V.has_dynrender) vkCmdBeginRendering(cb, &ri);
-        else { VkRenderPassBeginInfo rbi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, NULL, g_ov.rp, ofb, {{0, 0}, g_sext}, 0, NULL};
-               vkCmdBeginRenderPass(cb, &rbi, VK_SUBPASS_CONTENTS_INLINE); }
-        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_ov.pipe);
-        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_ov.layout, 0, 1, &g_ov.set, 0, NULL);
-        VkViewport vp = {0, 0, (float)g_sext.width, (float)g_sext.height, 0, 1}; VkRect2D sc = {{0, 0}, g_sext};
-        vkCmdSetViewport(cb, 0, 1, &vp); vkCmdSetScissor(cb, 0, 1, &sc);
-        ov_render(cb, ovm, menu, fps);
-        if (V.has_dynrender) vkCmdEndRendering(cb); else vkCmdEndRenderPass(cb);
+    int ov = (ovm || menu >= 0 || fps) && overlay_ready(cb, k, menu);   // (its uploads before any pass)
+    VkImageLayout lay; VkPipelineStageFlags ws;
+    VkFence busy[8]; uint32_t nb = 0; for (uint32_t i = 0; i < 8; i++) if (i != k) busy[nb++] = g_pfence[i];
+    if (path && vk_fsr_begin(cb, k, path, busy, nb, im, c, vk_window_bottom_up(), g_simg[idx], g_sview[idx], g_sfmt, (int)g_lext.width, (int)g_lext.height, g_rot)) {
+        if (ov) ov_draw_all(cb, ovm, menu, fps);   // in the picture's own pass: no load, store or barrier of its own
+        vk_fsr_end(cb);
+        lay = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL; ws = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    } else {   // the blit: the whole image cleared, the crop scaled into the picture's rectangle, the overlay in a pass of its own (an IDENTITY swapchain: g_rot 0 then)
+        path = VKFSR_OFF;
+        if (g_rot) { VKRED_ONCE(97, "the upscaling passes refused a picture on a pre-rotated swapchain: the next present makes it IDENTITY"); g_want_rot = 0; }
+        barrier(cb, g_simg[idx], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        VkClearColorValue black = {{0, 0, 0, 1}}; VkImageSubresourceRange rg = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdClearColorImage(cb, g_simg[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &rg);
+        VkImageBlit b = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{c[0], c[1], 0}, {c[0] + c[2], c[1] + c[3], 1}}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                         {{pic.x, pic.y, 0}, {pic.x + pic.w, pic.y + pic.h, 1}}};
+        if (vk_window_bottom_up()) { b.srcOffsets[0].y = c[1] + c[3]; b.srcOffsets[1].y = c[1]; }   // lower-left origin: the window image is stored bottom-up (gfx_vk_exec.c)
+        vkCmdBlitImage(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, g_simg[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
+        lay = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; ws = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        if (ov && (V.has_dynrender || ov_fb(idx))) {   // without dynamic rendering, only with the image's framebuffer
+            barrier(cb, g_simg[idx], lay, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL); lay = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            VkRenderingAttachmentInfo ca = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, NULL, g_sview[idx], lay, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED, VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_STORE_OP_STORE};
+            VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO, NULL, 0, {{0, 0}, g_sext}, 1, 0, 1, &ca, NULL, NULL};
+            VkFramebuffer ofb = V.has_dynrender ? VK_NULL_HANDLE : ov_fb(idx);
+            if (V.has_dynrender) vkCmdBeginRendering(cb, &ri);
+            else { VkRenderPassBeginInfo rbi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, NULL, g_ov.rp, ofb, {{0, 0}, g_sext}, 0, NULL};
+                   vkCmdBeginRenderPass(cb, &rbi, VK_SUBPASS_CONTENTS_INLINE); }
+            ov_draw_all(cb, ovm, menu, fps);
+            if (V.has_dynrender) vkCmdEndRendering(cb); else vkCmdEndRenderPass(cb);
+        }
     }
+    vk_fsr_time_end(cb, k);
     barrier(cb, g_simg[idx], lay, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
     vkEndCommandBuffer(cb);
-    VkPipelineStageFlags ws = VK_PIPELINE_STAGE_TRANSFER_BIT;
-    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 1, &g_acq[k], &ws, 1, &cb, 1, &g_done_sem[k]};
+    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 1, &g_acq[k], &ws, 1, &cb, 1, &g_done_sem[k]};   // (the acquire waited for where the image is first written)
     extern pthread_mutex_t g_vk_queue_mu;
     pthread_mutex_lock(&g_vk_queue_mu);
     if (vkQueueSubmit(V.q, 1, &si, g_pfence[k])) { pthread_mutex_unlock(&g_vk_queue_mu); VKRED_ONCE(91, "present submit failed"); return; }
+    vk_fsr_time_submitted(k, path);
     VkPresentInfoKHR pi = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, NULL, 1, &g_done_sem[k], 1, &g_swap, &idx, NULL};
     VkPresentTimeGOOGLE ptm = {++g_pace_id, period >= 0 ? pace_desired(period) : 0};
     VkPresentTimesInfoGOOGLE pti = {VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE, NULL, 1, &ptm};
@@ -774,6 +826,13 @@ static void present_window(vkimg_t *im, const int crop[4], double period, uint64
     if (V.has_dtiming && r >= 0) present_time_map(ptm.presentID, ticket);
     pthread_mutex_unlock(&g_vk_queue_mu);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) swap_destroy();
+    // Android (10 on) answers VK_SUBOPTIMAL_KHR while the display's transform hint differs from the swapchain's pre-transform (IDENTITY here): the compositor then turns every
+    // frame, in the display hardware or with the GPU. Counted, so a device log tells whether the game's screens are turned
+    else if (r == VK_SUBOPTIMAL_KHR) {
+        static uint64_t n; if (!n++ || n == 600) VKLOG("present: VK_SUBOPTIMAL_KHR (%llu so far): the display's transform (made at %#x) is not the swapchain's %#x, the compositor turns each frame%s",
+                                                       (unsigned long long)n, g_tf_now, ROT_TF[g_rot], g_want_rot ? "" : " (DM_VK_PRETRANSFORM=1 draws it turned)");
+        if (g_want_rot) { VkSurfaceCapabilitiesKHR cap; if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(V.pd, g_surf, &cap) == VK_SUCCESS && cap.currentTransform != g_tf_now) swap_destroy(); }
+    }
 }
 // headless frame shots
 static int shot_wanted(uint64_t n) {
@@ -813,6 +872,7 @@ void vk_window_lost(void) { pthread_mutex_lock(&g_present_mu); swap_destroy(); g
 #define PQ_N 4
 static struct { vkimg_t *im; int crop[4], has_crop; uint64_t n; double period; } g_pq[PQ_N];
 static uint64_t g_pq_head, g_pq_tail, g_pq_done;   // queued [tail, head), presents up to ticket g_pq_done are blitted
+static _Atomic uint64_t g_present_stall_ns;   // mtl_present_test_stall
 static pthread_mutex_t g_pq_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_pq_cv = PTHREAD_COND_INITIALIZER;
 // While the game is held (the pause menu) no frame comes: dm_overlay_redraw presents the last one again with what the overlay now shows.
 static _Atomic int g_redraw;
@@ -831,13 +891,16 @@ static void *present_thread(void *arg) {
         }
         typeof(g_pq[0]) e = g_pq[g_pq_tail % PQ_N];
         pthread_mutex_unlock(&g_pq_mu);
+        { uint64_t st = atomic_load(&g_present_stall_ns); if (st) { struct timespec ts = {(time_t)(st / 1000000000ull), (long)(st % 1000000000ull)}; nanosleep(&ts, NULL); } }   // (mtl_present_test_stall)
         if (e.im) { last = e; pthread_mutex_lock(&g_present_mu); if (swap_make()) present_window(e.im, e.has_crop ? e.crop : NULL, e.period, e.n); pthread_mutex_unlock(&g_present_mu); }
         pthread_mutex_lock(&g_pq_mu); g_pq_tail++; g_pq_done = e.n; pthread_cond_broadcast(&g_pq_cv); pthread_mutex_unlock(&g_pq_mu);
     }
     return NULL;
 }
 static void present_thread_start(void) { pthread_t t; pthread_create(&t, NULL, present_thread, NULL); pthread_detach(t); }
+extern _Atomic uint64_t dm_present_ns;   // hle_thread.c (DM_HITCH_DUMP: a dump of every thread when no present came for that long); nvn_mtl.m present_enqueue stores it too
 static uint64_t present_enqueue(vkimg_t *im, const int crop[4], uint64_t n, double period) {   // im NULL: nothing to show, the ticket still completes in order
+    atomic_store(&dm_present_ns, now_ns());
     static int sync = -1; static pthread_once_t once = PTHREAD_ONCE_INIT;
     if (sync < 0) sync = getenv("DM_VK_SYNC_PRESENT") != NULL;
     if (sync || !dm_front_window()) {   // headless: nothing to show; or presenting on this thread
@@ -908,7 +971,11 @@ void mtl_present_wait(uint64_t tk) {   // NVN acquire: the window texture's last
 double mtl_presented_time(uint64_t n) { return present_time_get(n); }
 double vk_refresh_ms(void) { return V.has_dtiming && g_pres_recorded && g_refresh_ns ? g_refresh_ns / 1e6 : 0; }   // perf_android.c's late check: the display's refresh, when display times are what it gets
 uint32_t mtl_present_qos(void) { return 0; }
-int mtl_link_active(void) { return 0; }
+// Every present queued so far processed (its blit submitted), as nvn_mtl.m's: the last ticket waited for
+void mtl_present_flush(void) { pthread_mutex_lock(&g_pq_mu); uint64_t h = g_pq_head ? g_pq[(g_pq_head - 1) % PQ_N].n : 0; pthread_mutex_unlock(&g_pq_mu); if (h) mtl_present_wait(h); }
+// The unit tests' extra pause before each present on the present thread (dm/gfx/tests/t_nvn.c): taken by present_thread
+void mtl_present_test_stall(uint64_t ns) { atomic_store(&g_present_stall_ns, ns); }
+int mtl_link_active(void) { return 0; }   // (no display link on Android: gfx_common.c)
 int mtl_link_wait_tick(int vsyncs, uint64_t timeout_ns) { (void)vsyncs; (void)timeout_ns; return 0; }
 int mtl_has_window(void) { return dm_front_window() != NULL; }
 int mtl_display_hz(void) { return 60; }

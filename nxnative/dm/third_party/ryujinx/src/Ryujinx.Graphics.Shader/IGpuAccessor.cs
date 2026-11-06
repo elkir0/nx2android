@@ -22,6 +22,32 @@ namespace Ryujinx.Graphics.Shader
         }
 
         /// <summary>
+        /// Size in bytes of the constant buffer 1 data the host knows (an Ampere jump table ends there at the latest).
+        /// </summary>
+        int QueryConstantBuffer1Size()
+        {
+            return 0;
+        }
+
+        /// <summary>
+        /// NVN2 (Switch 2) compute shaders: the counts of the shader's own driver constant layout in c[0] (uniform buffer entries, storage buffer entries, texture
+        /// handles), its size and the bytes of its push constants, from the control section; null for other shaders.
+        /// </summary>
+        int[] QueryAmpereComputeC0Layout()
+        {
+            return null;
+        }
+
+        /// <summary>
+        /// NVN2 (Switch 2) task and mesh shaders, translated as compute: the byte offsets in shared memory of the stage memory the build reads back (dmsh_meshstage.py): the
+        /// workgroup's number, the stage input (a task's payload), the outputs (a payload, or a mesh shader's attributes) and a mesh shader's primitive bytes; null for other shaders.
+        /// </summary>
+        int[] QueryAmpereStageMemory()
+        {
+            return null;
+        }
+
+        /// <summary>
         /// Gets a span of the specified memory location, containing shader code.
         /// </summary>
         /// <param name="address">GPU virtual address of the data</param>
@@ -221,6 +247,76 @@ namespace Ryujinx.Graphics.Shader
         int QueryHostSubgroupSize()
         {
             return 32;
+        }
+
+        /// <summary>
+        /// nx2android: whether the host binds the memory pool table and the write log through which a global memory access traced to no storage buffer goes
+        /// (GlobalToStorage.TryGenerateRawStorageOp, physical storage buffer pointers); without them such an access is dropped, as Ryujinx drops it.
+        /// </summary>
+        bool QueryHostSupportsRawGlobalMemory()
+        {
+            return true;
+        }
+
+        /// <summary>
+        /// nx2android: the most shared memory the host gives a compute workgroup, in bytes, 0 for no limit. A compute shader whose shared memories take more gets them
+        /// from a storage buffer, one slice per workgroup (ShaderProperties.SharedMemorySpill).
+        /// </summary>
+        int QueryHostSharedMemoryLimit()
+        {
+            return 0;
+        }
+
+        /// <summary>
+        /// nx2android: the slices of that storage buffer: workgroup w of a dispatch, w counted along x, then y, then z, takes slice w modulo this.
+        /// </summary>
+        int QueryHostSharedMemorySpillSlices()
+        {
+            return 512;
+        }
+
+        /// <summary>
+        /// nx2android: the bytes of such a shared memory kept in workgroup memory, its first ones (up to QueryHostSharedMemoryLimit); the rest lies in the buffer. 0: all of it
+        /// in the buffer.
+        /// </summary>
+        int QueryHostSharedMemorySpillKeep()
+        {
+            return 0;
+        }
+
+        /// <summary>
+        /// nx2android: float min / max / clamp as Maxwell's FMNMX and .SAT: a NaN operand gives the other operand (SPIR-V NMin / NMax / NClamp), where FMin / FMax / FClamp
+        /// leave a NaN's result to the device.
+        /// </summary>
+        bool QueryHostNanSafeMinMax()
+        {
+            return false;
+        }
+
+        /// <summary>
+        /// nx2android: a storage access at an address plus a multiple of 4 takes the word index of that address plus the constant's words (GlobalToStorage), so the words of
+        /// one wide access the frontend split into words share their index's computation.
+        /// </summary>
+        bool QueryHostWideStorageWords()
+        {
+            return false;
+        }
+
+        /// <summary>
+        /// nx2android: the HMMA.16816 helper (f16 accumulator) as packed half arithmetic, a sum in half precision (CodeGen/Spirv TensorF16); false: the per-lane float sum.
+        /// </summary>
+        bool QueryHostHmmaF16()
+        {
+            return false;
+        }
+
+        /// <summary>
+        /// nx2android: a task or mesh shader translated as compute (QueryAmpereStageMemory), to write as a Vulkan task or mesh shader around its body
+        /// (CodeGen/Spirv/MeshStage.cs); null to write it as the compute shader.
+        /// </summary>
+        MeshStageInfo QueryHostMeshStage()
+        {
+            return null;
         }
 
         /// <summary>

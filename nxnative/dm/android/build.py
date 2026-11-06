@@ -40,9 +40,13 @@ subprocess.run([sys.executable, str(DM / 'android/tools/android_profile.py'), 'h
 
 # the backend's own small shaders (dm/android/shaders): compiled with the NDK's glslc, embedded as gen/<name>_<stage>.spv.h
 GLSLC = Path(a.ndk) / 'shader-tools' / host / ('glslc.exe' if os.name == 'nt' else 'glslc')
-for sh in sorted((DM / 'android/shaders').glob('*.*')):
+SHD = DM / 'android/shaders'
+# what the stage files include lives in subdirectories (shaders/fsr/fsr1.glsl, the present's upscaling passes: gfx_vk_fsr.c): an edit there makes every stage again, as a
+# commit that changes only the include leaves the stage files' times as they were (a player's build folder would keep the old shaders)
+inc_t = max([p.stat().st_mtime for p in SHD.rglob('*') if p.is_file() and p.parent != SHD] or [0])
+for sh in sorted((DM / 'android/shaders').glob('*.*')):   # (every file there is a stage: what they include lives in subdirectories, SHD's rglob above)
     hdr = gen / a.game / f'{sh.stem}_{sh.suffix[1:]}.spv.h'
-    if hdr.exists() and hdr.stat().st_mtime >= sh.stat().st_mtime: continue
+    if hdr.exists() and hdr.stat().st_mtime >= max(sh.stat().st_mtime, inc_t): continue
     spv = gen / f'{sh.name}.spv'
     subprocess.run([str(GLSLC), '--target-env=vulkan1.1', '-O', str(sh), '-o', str(spv)], check=True)
     words = spv.read_bytes(); n = len(words) // 4
@@ -56,16 +60,23 @@ GFX = srcs('gfx/*.c', 'gfx/nvn/*.c', 'gfx/tex/*.c')
 PORT = [p for p in srcs('android/compat/*.c', 'android/*.c') if not (p.name == 'gfx_null.c' and a.gfx != 'null') and not (p.name.startswith('gfx_vk') and a.gfx != 'vk')]   # one graphics backend
 ASM = srcs('host/entry.S', 'gfx/nvn/nvn_entry.S', 'gfx/nvn/nvn_thunks.S')
 VPX = srcs('third_party/libvpx/**/*.c')
+# dav1d (AV1 movies, dm/host/hle_movie_av1.c): what dm/host/Makefile builds of it (every src/*.c but the templates, src/arm/cpu.c, the per-bit-depth wrappers in config/tmpl, the arm64
+# assembly but the parts other files include), with the Android configuration first (config/android: ELF symbols, getauxval). Its .S files are ELF assembly already (src/arm/asm.S)
+DAV1D = [p for p in srcs('third_party/dav1d/src/*.c') if not p.name.endswith('_tmpl.c')] + srcs('third_party/dav1d/src/arm/cpu.c', 'third_party/dav1d/config/tmpl/*.c') + \
+        [p for p in srcs('third_party/dav1d/src/arm/64/*.S') if not p.name.endswith('_tmpl.S') and p.name != 'util.S']
 
 INC = ['-include', str(DM / 'android/compat/include/darwin_compat.h'), f'-I{DM / "android/compat/include"}', f'-I{DM / "host"}', f'-I{DM / "gfx/nvn"}', f'-I{DM / "gfx/tex"}', f'-I{DM / "gfx/nvn/include"}',
-       f'-I{DM / "third_party/vulkan-headers/include"}', f'-I{gen / a.game}', f'-I{DM / "third_party/libvpx"}', f'-I{DM / "third_party/stb_vorbis"}', f'-I{DM / "android"}']
+       f'-I{DM / "third_party/vulkan-headers/include"}', f'-I{gen / a.game}', f'-I{DM / "third_party/libvpx"}', f'-I{DM / "third_party/stb_vorbis"}', f'-I{DM / "android"}',
+       f'-I{DM / "third_party/dav1d/include"}']
 CFLAGS = [TARGET, f'-O{a.O}'] + DBG + ['-fPIC', '-fno-omit-frame-pointer', '-ffixed-x18', '-Wall', '-Wno-unused-function', '-Wno-unused-variable', '-Wno-unused-but-set-variable',
           '-Wno-format', '-Wno-deprecated-declarations', '-Wno-gnu-folding-constant', '-Werror=implicit-function-declaration', '-Werror=return-type',
           '-Werror=incompatible-pointer-types', '-Werror=int-conversion', '-D_GNU_SOURCE', '-DDM_ANDROID=1', '-fno-strict-aliasing', '-fvisibility=hidden'] + (['-DDM_RELEASE=1'] if a.release else [])
 VPX_FLAGS = [TARGET, '-O2'] + DBG + ['-fPIC', f'-I{DM / "third_party/libvpx"}', f'-I{DM / "third_party/libvpx/config"}', '-w']
+_D1 = DM / 'third_party/dav1d'
+DAV1D_FLAGS = [TARGET, '-O2'] + DBG + ['-fPIC', '-fvisibility=hidden', '-fomit-frame-pointer', '-fno-align-functions', f'-I{_D1}', f'-I{_D1 / "include"}', f'-I{_D1 / "config/android"}', f'-I{_D1 / "config"}']
 
 import hashlib, shutil
-_stamp = obj / 'flags.stamp'; _flags = hashlib.sha256(repr((CFLAGS, INC, VPX_FLAGS, CC)).encode()).hexdigest()
+_stamp = obj / 'flags.stamp'; _flags = hashlib.sha256(repr((CFLAGS, INC, VPX_FLAGS, DAV1D_FLAGS, CC)).encode()).hexdigest()
 if not _stamp.exists() or _stamp.read_text() != _flags:   # compiler flags changed: every object is rebuilt
     shutil.rmtree(obj, ignore_errors=True); obj.mkdir(parents=True, exist_ok=True); _stamp.write_text(_flags)
 
@@ -81,13 +92,13 @@ def dep_stale(o, d, s):
 
 def compile_one(s):
     rel = s.relative_to(DM); o = obj / (str(rel).replace(os.sep, '_').replace('/', '_') + '.o'); d = o.with_suffix('.d')
-    src = s
-    if s.suffix == '.S':   # Mach-O assembly → ELF
+    src = s; dav1d = 'third_party/dav1d' in str(rel).replace(os.sep, '/')
+    if s.suffix == '.S' and not dav1d:   # Mach-O assembly → ELF
         src = gen / (s.stem + '.elf.S')
         if not src.exists() or src.stat().st_mtime < s.stat().st_mtime:
             subprocess.run([sys.executable, str(DM / 'android/tools/darwin2elf.py'), str(s), str(src)], check=True)
     if not dep_stale(o, d, src): return s, o, 0, ''
-    flags = VPX_FLAGS if 'third_party/libvpx' in str(rel).replace(os.sep, '/') else [TARGET] + DBG if s.suffix == '.S' else CFLAGS + INC
+    flags = VPX_FLAGS if 'third_party/libvpx' in str(rel).replace(os.sep, '/') else DAV1D_FLAGS if dav1d else [TARGET] + DBG if s.suffix == '.S' else CFLAGS + INC
     r = subprocess.run([CC] + flags + ['-MMD', '-MF', str(d), '-c', str(src), '-o', str(o)], capture_output=True, text=True, errors='replace')
     return s, o, r.returncode, r.stderr
 
@@ -103,8 +114,9 @@ def build(files):
 all_files = HOST + GFX + PORT + ASM
 objs, failed = build(all_files)
 vobjs, vfailed = build(VPX)
-failed += vfailed
-print(f'compiled {len(all_files) + len(VPX)} sources, {len(failed)} failed' + (': ' + ', '.join(str(f.relative_to(DM)) for f in failed) if failed else ''))
+dobjs, dfailed = build(DAV1D); vobjs += dobjs   # linked with libvpx's
+failed += vfailed + dfailed
+print(f'compiled {len(all_files) + len(VPX) + len(DAV1D)} sources, {len(failed)} failed' + (': ' + ', '.join(str(f.relative_to(DM)) for f in failed) if failed else ''))
 if failed and not a.keep_going: sys.exit(1)
 if a.only_compile: sys.exit(1 if failed else 0)
 

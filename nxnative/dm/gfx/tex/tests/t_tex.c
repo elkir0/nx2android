@@ -45,7 +45,85 @@ static void roundtrip(const char *tag, int target, int fmt, uint32_t w, uint32_t
     free(st);
 }
 
+// Compare both copy directions against byte addresses, independently of move()'s segment arithmetic.
+// Comparing all storage bytes and padded rows also checks that tails leave unrelated data untouched.
+static void differential(const nvn_texdesc *d, unsigned level, unsigned layer) {
+    uint32_t rb, rows, slices, bpb; uint64_t base; unsigned th, td;
+    int rc = nvn_deswizzle_geom(d, level, layer, &rb, &rows, &slices, &base, &th, &td, &bpb);
+    CHECK(!rc, "D geometry failed"); if (rc) return;
+    nvn_texlayout L; nvn_tex_layout(d, &L);
+    size_t pitch = rb + 1 + (rnd() & 31), nlin = pitch * rows * slices, nst = L.size + 32;
+    uint8_t *storage = malloc(nst), *expected = malloc(nst), *linear = malloc(nlin + 32), *out = malloc(nlin + 32);
+    for (size_t i = 0; i < nst; i++) storage[i] = rnd();
+    memset(linear, 0xAB, nlin + 32); memset(out, 0xAB, nlin + 32);
+    uint32_t lb = nvn_tex_level_gobs(d, level) * 64;
+    if (lb < rb) lb = rb;
+    for (uint32_t z = 0; z < slices; z++) for (uint32_t y = 0; y < rows; y++) for (uint32_t x = 0; x < rb; x++)
+        linear[((size_t)z * rows + y) * pitch + x] = storage[base + nvn_bl_offset(x, y, z, lb, rows, th, td)];
+    CHECK(!nvn_deswizzle(d, level, layer, storage, out, pitch) && !memcmp(linear, out, nlin + 32),
+          "D read differs target %d format %#x flags %#x mip %u layer %u", d->target, d->format, d->flags, level, layer);
+    for (size_t i = 0; i < nlin; i++) linear[i] = rnd();
+    memcpy(expected, storage, nst);
+    for (uint32_t z = 0; z < slices; z++) for (uint32_t y = 0; y < rows; y++) for (uint32_t x = 0; x < rb; x++)
+        expected[base + nvn_bl_offset(x, y, z, lb, rows, th, td)] = linear[((size_t)z * rows + y) * pitch + x];
+    CHECK(!nvn_swizzle(d, level, layer, linear, pitch, storage) && !memcmp(storage, expected, nst),
+          "D write differs target %d format %#x flags %#x mip %u layer %u", d->target, d->format, d->flags, level, layer);
+    CHECK(nvn_swizzle(d, level, layer, linear, rb - 1, storage) == -1 && !memcmp(storage, expected, nst),
+          "D short source pitch accepted");
+    CHECK(nvn_deswizzle(d, level, layer, storage, out, rb - 1) == -1,
+          "D short destination pitch accepted");
+    free(storage); free(expected); free(linear); free(out);
+}
+
+static void differential_shapes(void) {
+    static const int formats[] = {0x01, 0x0D, 0x19, 0x1D, 0x22, 0x25, 0x29, 0x2E, 0x42, 0x44, 0x82, 0x85};
+    static const int targets[] = {0, 1, 2, 3, 4, 7, 8, 9};
+    static const uint32_t widths[] = {1, 3, 7, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 129};
+    unsigned cases = 0;
+    for (unsigned i = 0; i < 256; i++) {
+        nvn_texdesc d = {0};
+        d.target = targets[i % 8]; d.format = formats[(i / 8) % 12];
+        d.width = widths[rnd() % 14]; d.height = 1 + rnd() % 65; d.depth = 1 + rnd() % 9; d.levels = 4;
+        if (d.target == 3) d.height = 3;
+        if (d.target == 9) d.depth = 12;
+        if ((i / 8) & 1) d.pkg_block_h = 1 + (rnd() % 4) + (d.target == 2 ? (rnd() % 3) * 16 : 0);
+        if ((i / 16) & 1) d.flags = 0x20;
+        nvn_texlayout L; nvn_tex_layout(&d, &L);
+        for (unsigned l = 0; l < d.levels; l++) {
+            differential(&d, l, L.layers - 1); cases++;
+        }
+    }
+    // Sparse levels wide enough for padded GOB columns, followed by their mip tails.
+    nvn_texdesc sparse = {1, 0x7D, 0x20, 0, 1024, 1024, 1, 5, 0, 0};
+    for (unsigned l = 0; l < sparse.levels; l++) { differential(&sparse, l, 0); cases++; }
+    printf("  D %u layouts: both directions equal byte-address oracle, including pitch padding and tails\n", cases);
+}
+
 int main(void) {
+    printf("D differential copy checks\n");
+    differential_shapes();
+    printf("L linear render targets without the separate LINEAR flag\n");
+    {
+        // Persona 5 Royal asks for 16x16 RGBA8, flags 0x44, stride 128: 2 KB,
+        // including row padding. Treating it as block-linear returned only 1 KB.
+        nvn_texdesc d = {1, 0x25, 0x44, 0, 16, 16, 1, 1, 128, 0};
+        nvn_texlayout L; nvn_tex_layout(&d, &L);
+        CHECK(L.size == 2048 && L.layer_size == 2048 && L.align == 128,
+              "L render target storage %llu alignment %u, expected 2048 / 128", (unsigned long long)L.size, L.align);
+        CHECK(nvn_tex_level_gobs(&d, 0) == 0 && nvn_tex_level_offset(&d, 0) == 0,
+              "L linear render target must not have block-linear GOB columns");
+        uint8_t storage[2048] = {0}, pixels[1024] = {0};
+        CHECK(nvn_deswizzle(&d, 0, 0, storage, pixels, 64) == -1,
+              "L linear render target must not be deswizzled");
+        d.stride = 0; nvn_tex_layout(&d, &L);
+        CHECK(L.size == 2048 && L.align == 128, "L implicit render target stride must align to 128");
+        d.flags |= 0x10; nvn_tex_layout(&d, &L);
+        CHECK(L.size == 2048 && L.align == 128, "L both linear flags must keep render target alignment");
+        d.flags = 0x10; nvn_tex_layout(&d, &L);
+        CHECK(L.size == 1024 && L.align == 32, "L ordinary linear texture keeps 32-byte alignment");
+        d.flags = 0x44; d.stride = 256; nvn_tex_layout(&d, &L);
+        CHECK(L.size == 4096, "L explicit padded stride must be preserved");
+    }
     printf("A round trip (random data, non-power-of-2 sizes)\n");
     roundtrip("2D 100×37 R8 4 levels", 1, 0x01, 100, 37, 1, 4);
     roundtrip("2D 100×37 RG8 4 levels", 1, 0x0D, 100, 37, 1, 4);
@@ -77,6 +155,18 @@ int main(void) {
         CHECK(got == B[i].want, "B%u got %llu expected %llu", i, (unsigned long long)got, (unsigned long long)B[i].want);
         printf("  B%u (%u,%u,%u) → %llu %s  %s\n", i, B[i].x, B[i].y, B[i].z, (unsigned long long)got, got == B[i].want ? "✓" : "✗", B[i].how);
     }
+    // The Switch 2's order inside a GOB (nvn_deswizzle.h): bits 5 and 6 of the offset exchanged, x%32/16 at 64 and y%4/2 at 32. Where only one of the two is set the orders differ
+    printf("B2 address formula, the Switch 2's order inside a GOB: (x%%64/32)·256 + (y%%8/4)·128 + (x%%32/16)·64 + (y%%4/2)·32 + (y%%2)·16 + x%%16\n");
+    struct { uint32_t x, y; uint64_t want, x1; } B2[] = {{16, 0, 64, 32}, {0, 2, 32, 64}, {21, 5, 213, 181}, {17, 3, 113, 113}, {70, 9, 1558, 1558}};
+    nvn_gob_switch2 = 1;
+    for (unsigned i = 0; i < sizeof B2 / sizeof *B2; i++) {
+        uint64_t got = nvn_bl_offset(B2[i].x, B2[i].y, 0, 128, 32, 1, 0);
+        CHECK(got == B2[i].want, "B2 (%u,%u) got %llu expected %llu", B2[i].x, B2[i].y, (unsigned long long)got, (unsigned long long)B2[i].want);
+        printf("  B2 (%u,%u) → %llu %s (the X1's order: %llu)\n", B2[i].x, B2[i].y, (unsigned long long)got, got == B2[i].want ? "✓" : "✗", (unsigned long long)B2[i].x1);
+    }
+    nvn_gob_switch2 = 0;
+    for (unsigned i = 0; i < sizeof B2 / sizeof *B2; i++)
+        CHECK(nvn_bl_offset(B2[i].x, B2[i].y, 0, 128, 32, 1, 0) == B2[i].x1, "B2 (%u,%u) in the X1's order expected %llu", B2[i].x, B2[i].y, (unsigned long long)B2[i].x1);
 
     // ---------- E hand-built 3D: place markers into block-linear storage at hand-calculated addresses, decode, and verify where the markers land (round trip A only proves self-consistency, not whether the layout is right) ----------
     // Source of the block height / block depth rule: deko3d dk_image.cpp - for 3D textures block height is fixed at 1 GOB, block depth = pickTileSize(depth + depth/2).
@@ -111,6 +201,34 @@ int main(void) {
         printf("  E 32³ RGBA16F (the shape of a 32³ color lookup table) block height/depth %u/%u, storage %llu (expected 0/4, 262144)\n", L.tileH, L.tileD, (unsigned long long)L.size);
     }
 
+    // Packaged 32³ RGBA8: markers computed independently with block height/depth 0/0 or 2/1.
+    // For byte 0x12, (20,11,3) is at depth block 8192 + column 4096 + GOB 2560 + intra-GOB 112 = 14960.
+    // For byte 0x00, the same voxel is at slice 12288 + row 1024 + column 512 + intra-GOB 112 = 13936.
+    printf("E packaged 3D block dimensions and mip reductions\n");
+    for (unsigned c = 0; c < 2; c++) {
+        nvn_texdesc d = {2, 0x25, 0, 0, 32, 32, 32, 3, 0, c ? 0x13 : 1};
+        nvn_texlayout L; nvn_tex_layout(&d, &L);
+        CHECK(L.size == 151552, "E packaged storage %llu expected 151552", (unsigned long long)L.size);
+        for (unsigned l = 0; l < 3; l++) {
+            unsigned th, td; nvn_tex_level_tiles(&d, l, &th, &td);
+            CHECK(th == (c ? 2 - l : 0) && td == (c ? 1 : 0),
+                  "E packaged byte %#x mip %u block %u/%u", d.pkg_block_h - 1, l, th, td);
+        }
+        CHECK(nvn_tex_level_offset(&d, 1) == 131072 && nvn_tex_level_offset(&d, 2) == 147456,
+              "E packaged mip offsets must be 131072 / 147456");
+        static const uint32_t xyz[3][3] = {{20,11,3}, {5,2,1}, {31,31,31}};
+        static const uint64_t addr[2][3] = {{13936,4196,131068}, {14960,2148,131068}};
+        uint8_t *st = calloc(L.size, 1), *lin = calloc(131072, 1);
+        for (unsigned i = 0; i < 3; i++) for (unsigned k = 0; k < 4; k++) st[addr[c][i] + k] = (uint8_t)(i * 16 + k + 1);
+        CHECK(!nvn_deswizzle(&d, 0, 0, st, lin, 128), "E packaged deswizzle failed");
+        for (unsigned i = 0; i < 3; i++) {
+            const uint8_t *p = lin + ((size_t)xyz[i][2] * 32 + xyz[i][1]) * 128 + xyz[i][0] * 4;
+            int ok = 1; for (unsigned k = 0; k < 4; k++) ok &= p[k] == (uint8_t)(i * 16 + k + 1);
+            CHECK(ok, "E packaged byte %#x marker %u at %llu decoded at the wrong voxel", d.pkg_block_h - 1, i, (unsigned long long)addr[c][i]);
+        }
+        free(st); free(lin);
+    }
+
     // ---------- S sparse layout: Monster Hunter Rise's streamed 1024×1024 ASTC 6×6 sRGB textures (flag SPARSE, packaged block height 8 GOBs), level 0 checked against the game's data ----------
     // A 64 KB tile is 16 GOBs × 8 GOBs here. Level 0 (171 block columns = 43 GOBs) is padded to 48 GOBs × 3 block rows = 9 tiles: its dumped data decodes with no all-zero block that way
     // (2,183 unpadded). Level 1 (86 = 22 GOBs → 32, 2 block rows) is 4 tiles; level 2 (43 block columns, less than a tile's 64) starts the mip tail, packed as before; storage in whole tiles
@@ -126,6 +244,71 @@ int main(void) {
         d.flags = 0; nvn_tex_layout(&d, &L);   // the same texture not sparse keeps the packed layout
         CHECK(nvn_tex_level_offset(&d, 1) == 0x81000 && L.size == 0xBC400 && nvn_tex_level_gobs(&d, 0) == 43, "S not sparse: level 1 %#llx storage %#llx, expected 0x81000 / 0xbc400",
               (unsigned long long)nvn_tex_level_offset(&d, 1), (unsigned long long)L.size);
+    }
+
+    // ---------- N the Switch 2's layout (NVN2) as Mario Kart World's texture headers record it ----------
+    // Each row is one texture header of the game's BNTX files (the header's numbers only: shape, level count, packaged block height (layout byte 0), image size and every level's
+    // offset), chosen from the 86,489 textures it ships to cover every format class, block height, target and odd size; the layout here matched all of them (nvn_tex.c layer_bytes).
+    // The three sparse ones (texture flags 15: 512x512 BC4 / R16 / RG16) end with their mip tail on the Switch 2; on the Switch the same layouts keep their whole 64 KB tiles
+    printf("N the Switch 2's layouts from Mario Kart World's texture headers (size and level offsets)\n");
+    {
+        static const struct { int format, target, flags; uint32_t w, h, depth, levels, pkg; uint64_t size, off[14]; } N[] = {
+        {0x42, 1, 0x20, 512, 512, 1, 10, 0x3, 0x2b400, {0x0, 0x20000, 0x28000, 0x2a000, 0x2a800, 0x2aa00, 0x2ac00, 0x2ae00, 0x2b000, 0x2b200}},
+        {0x6, 1, 0x20, 512, 512, 1, 10, 0x4, 0xab400, {0x0, 0x80000, 0xa0000, 0xa8000, 0xaa000, 0xaa800, 0xaac00, 0xaae00, 0xab000, 0xab200}},
+        {0x25, 1, 0x20, 512, 512, 1, 10, 0x4, 0x155c00, {0x0, 0x100000, 0x140000, 0x150000, 0x154000, 0x155000, 0x155400, 0x155600, 0x155800, 0x155a00}},
+        {0x1, 1, 0x0, 2048, 2048, 1, 12, 0x4, 0x556400, {0x0, 0x400000, 0x500000, 0x540000, 0x550000, 0x554000, 0x555000, 0x555800, 0x555c00, 0x555e00, 0x556000, 0x556200}},
+        {0x6, 1, 0x0, 512, 512, 1, 10, 0x4, 0xab400, {0x0, 0x80000, 0xa0000, 0xa8000, 0xaa000, 0xaa800, 0xaac00, 0xaae00, 0xab000, 0xab200}},
+        {0x25, 4, 0x0, 64, 128, 3, 8, 0x4, 0x24000, {0x0, 0x8000, 0xa000, 0xa800, 0xac00, 0xae00, 0xb000, 0xb200}},
+        {0x29, 1, 0x0, 256, 256, 1, 9, 0x4, 0xab000, {0x0, 0x80000, 0xa0000, 0xa8000, 0xaa000, 0xaa800, 0xaaa00, 0xaac00, 0xaae00}},
+        {0x2e, 4, 0x0, 18, 301, 3, 1, 0x4, 0x5a000, {0x0}},
+        {0x42, 1, 0x0, 2048, 2048, 1, 12, 0x4, 0x2ab400, {0x0, 0x200000, 0x280000, 0x2a0000, 0x2a8000, 0x2aa000, 0x2aa800, 0x2aaa00, 0x2aac00, 0x2aae00, 0x2ab000, 0x2ab200}},
+        {0x43, 1, 0x0, 2048, 2048, 1, 12, 0x4, 0x555e00, {0x0, 0x400000, 0x500000, 0x540000, 0x550000, 0x554000, 0x555000, 0x555400, 0x555600, 0x555800, 0x555a00, 0x555c00}},
+        {0x42, 1, 0x0, 2560, 2560, 1, 12, 0x4, 0x47ba00, {0x0, 0x320000, 0x410000, 0x460000, 0x474000, 0x479000, 0x47a800, 0x47b000, 0x47b200, 0x47b400, 0x47b600, 0x47b800}},
+        {0x43, 1, 0x0, 8192, 8192, 1, 14, 0x4, 0x5555e00, {0x0, 0x4000000, 0x5000000, 0x5400000, 0x5500000, 0x5540000, 0x5550000, 0x5554000, 0x5555000, 0x5555400, 0x5555600, 0x5555800, 0x5555a00, 0x5555c00}},
+        {0x79, 1, 0x0, 2048, 2048, 1, 12, 0x4, 0x555e00, {0x0, 0x400000, 0x500000, 0x540000, 0x550000, 0x554000, 0x555000, 0x555400, 0x555600, 0x555800, 0x555a00, 0x555c00}},
+        {0x7b, 1, 0x0, 2273, 1425, 1, 12, 0x0, 0x2b0200, {0x0, 0x201000, 0x281400, 0x2a1e00, 0x2ab400, 0x2ae400, 0x2af400, 0x2af800, 0x2afa00, 0x2afc00, 0x2afe00, 0x2b0000}},
+        {0x7d, 1, 0x0, 1024, 4096, 1, 13, 0x0, 0x26f000, {0x0, 0x1ce400, 0x244800, 0x262c00, 0x26b000, 0x26d400, 0x26e000, 0x26e400, 0x26e600, 0x26e800, 0x26ea00, 0x26ec00, 0x26ee00}},
+        {0x80, 1, 0x0, 6040, 8192, 1, 14, 0x4, 0xfc8c00, {0x0, 0xbd0000, 0xec8000, 0xf88000, 0xfb8000, 0xfc4000, 0xfc7000, 0xfc7c00, 0xfc8000, 0xfc8200, 0xfc8400, 0xfc8600, 0xfc8800, 0xfc8a00}},
+        {0x80, 1, 0x0, 4119, 625, 1, 13, 0x0, 0xdd200, {0x0, 0xa1400, 0xc9e00, 0xd6400, 0xda800, 0xdba00, 0xdc200, 0xdc600, 0xdc800, 0xdca00, 0xdcc00, 0xdce00, 0xdd000}},
+        {0x80, 4, 0x0, 2048, 315, 13, 12, 0x0, 0x2f8800, {0x0, 0x28000, 0x34000, 0x38000, 0x39000, 0x39800, 0x39c00, 0x39e00, 0x3a000, 0x3a200, 0x3a400, 0x3a600}},
+        {0x80, 4, 0x0, 2048, 353, 2, 12, 0x0, 0x85000, {0x0, 0x30000, 0x3c000, 0x40000, 0x41000, 0x41800, 0x41c00, 0x41e00, 0x42000, 0x42200, 0x42400, 0x42600}},
+        {0x80, 1, 0x0, 1024, 105, 1, 11, 0x1, 0xc800, {0x0, 0x8000, 0xa000, 0xb000, 0xb800, 0xbc00, 0xbe00, 0xc000, 0xc200, 0xc400, 0xc600}},
+        {0x43, 8, 0x0, 64, 64, 6, 7, 0x1, 0xc000, {0x0, 0x1000, 0x1400, 0x1600, 0x1800, 0x1a00, 0x1c00}},
+        {0x80, 4, 0x0, 41, 83, 4, 7, 0x1, 0x5000, {0x0, 0x800, 0xa00, 0xc00, 0xe00, 0x1000, 0x1200}},
+        {0x7d, 4, 0x0, 49, 64, 3, 7, 0x1, 0x4800, {0x0, 0xc00, 0xe00, 0x1000, 0x1200, 0x1400, 0x1600}},
+        {0x80, 1, 0x0, 4154, 307, 1, 13, 0x2, 0xafa00, {0x0, 0x82000, 0xa2800, 0xaac00, 0xace00, 0xae000, 0xaea00, 0xaee00, 0xaf000, 0xaf200, 0xaf400, 0xaf600, 0xaf800}},
+        {0x80, 1, 0x0, 2092, 307, 1, 12, 0x2, 0x59a00, {0x0, 0x42000, 0x52800, 0x56c00, 0x57e00, 0x58800, 0x58e00, 0x59000, 0x59200, 0x59400, 0x59600, 0x59800}},
+        {0x80, 4, 0x0, 1229, 189, 13, 11, 0x2, 0x16c000, {0x0, 0x13800, 0x18800, 0x19c00, 0x1a600, 0x1ac00, 0x1b000, 0x1b200, 0x1b400, 0x1b600, 0x1b800}},
+        {0x80, 4, 0x0, 1229, 212, 2, 11, 0x2, 0x38000, {0x0, 0x13800, 0x18800, 0x19c00, 0x1a600, 0x1ac00, 0x1b000, 0x1b200, 0x1b400, 0x1b600, 0x1b800}},
+        {0x80, 1, 0x0, 4413, 512, 1, 13, 0x3, 0xba800, {0x0, 0x8a000, 0xac800, 0xb5400, 0xb7800, 0xb8a00, 0xb9400, 0xb9a00, 0xb9e00, 0xba000, 0xba200, 0xba400, 0xba600}},
+        {0x80, 4, 0x0, 512, 471, 2, 10, 0x3, 0x2c000, {0x0, 0x10000, 0x14000, 0x15000, 0x15400, 0x15600, 0x15800, 0x15a00, 0x15c00, 0x15e00}},
+        {0x80, 4, 0x0, 614, 360, 2, 10, 0x3, 0x38000, {0x0, 0x14000, 0x19000, 0x1a400, 0x1aa00, 0x1ae00, 0x1b000, 0x1b200, 0x1b400, 0x1b600}},
+        {0x80, 1, 0x0, 307, 4915, 1, 13, 0x4, 0x94800, {0x0, 0x64000, 0x82000, 0x8e000, 0x92000, 0x93000, 0x93800, 0x93c00, 0x93e00, 0x94000, 0x94200, 0x94400, 0x94600}},
+        {0x80, 1, 0x0, 1022, 2048, 1, 12, 0x4, 0xab600, {0x0, 0x80000, 0xa0000, 0xa8000, 0xaa000, 0xaa800, 0xaaa00, 0xaac00, 0xaae00, 0xab000, 0xab200, 0xab400}},
+        {0x80, 4, 0x0, 1434, 1434, 46, 11, 0x4, 0x2bd8000, {0x0, 0xb4000, 0xe2000, 0xee000, 0xf1000, 0xf1c00, 0xf2000, 0xf2200, 0xf2400, 0xf2600, 0xf2800}},
+        {0x7d, 4, 0x0, 492, 553, 2, 10, 0x4, 0x74000, {0x0, 0x2a000, 0x35000, 0x38000, 0x38c00, 0x39000, 0x39200, 0x39400, 0x39600, 0x39800}},
+        {0x42, 2, 0x0, 64, 64, 64, 7, 0x40, 0x27e00, {0x0, 0x20000, 0x24000, 0x26000, 0x27000, 0x27800, 0x27c00}},
+        };
+        unsigned bad = 0;
+        nvn_gob_switch2 = 1;
+        for (unsigned i = 0; i < sizeof N / sizeof *N; i++) {
+            nvn_texdesc d = {N[i].target, N[i].format, N[i].flags, 0, N[i].w, N[i].h, N[i].depth, N[i].levels, 0, (int)N[i].pkg + 1}; nvn_texlayout L; nvn_tex_layout(&d, &L);
+            int ok = L.size == N[i].size;
+            for (unsigned l = 0; l < N[i].levels; l++) ok &= nvn_tex_level_offset(&d, l) == N[i].off[l];
+            bad += !ok;
+            CHECK(ok, "N %ux%ux%u format %#x target %d levels %u block height %u%s: storage %#llx (header %#llx), level 1 at %#llx (header %#llx)", N[i].w, N[i].h, N[i].depth, N[i].format, N[i].target, N[i].levels,
+                  N[i].pkg, N[i].flags ? " sparse" : "", (unsigned long long)L.size, (unsigned long long)N[i].size, (unsigned long long)(N[i].levels > 1 ? nvn_tex_level_offset(&d, 1) : 0), (unsigned long long)N[i].off[N[i].levels > 1]);
+        }
+        nvn_gob_switch2 = 0;
+        unsigned sw1 = 0;   // the Switch: the sparse ones keep whole tiles, the rest is the same layout
+        for (unsigned i = 0; i < sizeof N / sizeof *N; i++) {
+            nvn_texdesc d = {N[i].target, N[i].format, N[i].flags, 0, N[i].w, N[i].h, N[i].depth, N[i].levels, 0, (int)N[i].pkg + 1}; nvn_texlayout L; nvn_tex_layout(&d, &L);
+            uint64_t want = N[i].flags ? (N[i].size + 0xFFFF) & ~0xFFFFull : N[i].size;
+            int ok = L.size == want && nvn_tex_level_offset(&d, N[i].levels - 1) == N[i].off[N[i].levels - 1];
+            sw1 += !ok;
+            CHECK(ok, "N on the Switch %ux%ux%u format %#x%s: storage %#llx, expected %#llx", N[i].w, N[i].h, N[i].depth, N[i].format, N[i].flags ? " sparse" : "", (unsigned long long)L.size, (unsigned long long)want);
+        }
+        printf("  N %u headers: %u match on the Switch 2; on the Switch the sparse ones are whole tiles (%u wrong)\n", (unsigned)(sizeof N / sizeof *N), (unsigned)(sizeof N / sizeof *N) - bad, sw1);
     }
 
     printf("%s: %d/%d checks passed\n", fails ? "RED" : "all passed", checks - fails, checks);

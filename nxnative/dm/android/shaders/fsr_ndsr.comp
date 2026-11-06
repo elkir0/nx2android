@@ -1,0 +1,7 @@
+#version 450
+// Android port: the game's own upscaler swapped for FSR 1's EASU (gfx_vk_fsr.c "NDSR swap", DM_VK_NDSR), 32-bit: fsr/fsr1.glsl
+#extension GL_GOOGLE_include_directive : require
+#define FSR_H 0
+#define FSR_CS 1
+#include "fsr/fsr1.glsl"
+void main() { fsr_ndsr_main(); }

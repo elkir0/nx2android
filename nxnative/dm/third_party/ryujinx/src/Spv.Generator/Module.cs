@@ -11,7 +11,7 @@ namespace Spv.Generator
         // TODO: Register on SPIR-V registry.
         private const int GeneratorId = 0;
 
-        private readonly uint _version;
+        private uint _version;   // nx2android: not readonly, a mesh module takes SPIR-V 1.4 (MeshShadingExt.cs SetVersion)
 
         private uint _bound;
 

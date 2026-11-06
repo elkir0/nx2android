@@ -39,7 +39,7 @@ namespace Ryujinx.Graphics.Shader.StructuredIr
             Add(Instruction.AtomicXor,                AggregateType.U32,    AggregateType.S32,     AggregateType.S32,     AggregateType.U32);
             Add(Instruction.Absolute,                 AggregateType.Scalar, AggregateType.Scalar);
             Add(Instruction.Add,                      AggregateType.Scalar, AggregateType.Scalar,  AggregateType.Scalar);
-            Add(Instruction.Ballot,                   AggregateType.U32,    AggregateType.Bool);
+            Add(Instruction.Ballot,                   AggregateType.U32,    AggregateType.Bool,    AggregateType.U32);
             Add(Instruction.BitCount,                 AggregateType.S32,    AggregateType.S32);
             Add(Instruction.BitfieldExtractS32,       AggregateType.S32,    AggregateType.S32,     AggregateType.S32,     AggregateType.S32);
             Add(Instruction.BitfieldExtractU32,       AggregateType.U32,    AggregateType.U32,     AggregateType.S32,     AggregateType.S32);

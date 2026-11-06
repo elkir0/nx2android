@@ -39,6 +39,46 @@ void mavc_free(mavc *a) { if (!a) return; mavc_drop(a); close_codec(a); free(a->
 int mavc_queued(const mavc *a) { return a->nq; }
 int mavc_held(const mavc *a) { return a->nq + (a->mc && !a->eos_sent && a->nin > a->nout ? (int)(a->nin - a->nout) : 0); }
 void mavc_set_rgba(mavc *a) { a->rgba = 1; }
+// The stream's colour matrix (hle_movie.c's nv12-colorspace): the SPS's VUI matrix_coefficients (H.264 E.2.1), which VideoToolbox puts in its format description (hle_movie_avc.c);
+// 1 is BT.709, 5 / 6 BT.601, 9 / 10 BT.2020. An SPS without one (or none yet) is BT.709 from 720 lines up, as VideoToolbox's pictures then are
+typedef struct { uint8_t r[512]; size_t n, bit; int bad; } sps_bits;
+static unsigned sb_u(sps_bits *b, unsigned n) {
+    if (n > 32 || b->bit + n > b->n * 8) { b->bad = 1; return 0; }
+    unsigned v = 0; while (n--) { v = v << 1 | (b->r[b->bit / 8] >> (7 - b->bit % 8) & 1); b->bit++; }
+    return v;
+}
+static unsigned sb_ue(sps_bits *b) { unsigned z = 0; while (!b->bad && !sb_u(b, 1)) if (++z > 31) { b->bad = 1; return 0; } return b->bad ? 0 : (1u << z) - 1 + sb_u(b, z); }
+static int sps_matrix(const uint8_t *nal, size_t n) {   // matrix_coefficients, or -1 when the SPS declares none (or cannot be read)
+    sps_bits b = {.n = 0};
+    for (size_t i = 1; i < n && b.n < sizeof b.r; i++) { if (i >= 3 && nal[i] == 3 && !nal[i - 1] && !nal[i - 2]) continue; b.r[b.n++] = nal[i]; }   // emulation prevention bytes out
+    unsigned profile = sb_u(&b, 8); sb_u(&b, 16); sb_ue(&b);   // constraints and level; seq_parameter_set_id
+    if (profile == 100 || profile == 110 || profile == 122 || profile == 244 || profile == 44 || profile == 83 || profile == 86 || profile == 118 || profile == 128 || profile == 138 || profile == 139 || profile == 134 || profile == 135) {
+        unsigned chroma = sb_ue(&b); if (chroma == 3) sb_u(&b, 1);
+        sb_ue(&b); sb_ue(&b); sb_u(&b, 1);   // bit depths, transform bypass
+        if (sb_u(&b, 1)) for (unsigned i = 0; i < (chroma == 3 ? 12u : 8u) && !b.bad; i++) if (sb_u(&b, 1)) {   // scaling lists
+            int last = 8, next = 8;
+            for (unsigned j = 0; j < (i < 6 ? 16u : 64u) && !b.bad; j++) { if (next) { unsigned c = sb_ue(&b); int d = c & 1 ? (int)((c + 1) / 2) : -(int)(c / 2); next = (last + d) & 255; } if (next) last = next; }
+        }
+    }
+    sb_ue(&b);   // log2_max_frame_num_minus4
+    unsigned poc = sb_ue(&b);
+    if (poc == 0) sb_ue(&b);
+    else if (poc == 1) { sb_u(&b, 1); sb_ue(&b); sb_ue(&b); unsigned k = sb_ue(&b); for (unsigned i = 0; i < k && !b.bad; i++) sb_ue(&b); }   // signed values read as ue: only their lengths matter
+    sb_ue(&b); sb_u(&b, 1); sb_ue(&b); sb_ue(&b);   // max_num_ref_frames, gaps, width and height in macroblocks
+    if (!sb_u(&b, 1)) sb_u(&b, 1);   // frame_mbs_only_flag, else mb_adaptive_frame_field_flag
+    sb_u(&b, 1);   // direct_8x8_inference_flag
+    if (sb_u(&b, 1)) { sb_ue(&b); sb_ue(&b); sb_ue(&b); sb_ue(&b); }   // frame cropping
+    if (!sb_u(&b, 1) || b.bad) return -1;   // no VUI
+    if (sb_u(&b, 1) && sb_u(&b, 8) == 255) sb_u(&b, 32);   // aspect ratio (extended SAR)
+    if (sb_u(&b, 1)) sb_u(&b, 1);   // overscan
+    if (!sb_u(&b, 1)) return -1;   // no video signal type
+    sb_u(&b, 4);   // video_format, video_full_range_flag
+    if (!sb_u(&b, 1)) return -1;   // no colour description
+    sb_u(&b, 16);   // colour primaries, transfer characteristics
+    unsigned mc = sb_u(&b, 8);
+    return b.bad || mc == 2 ? -1 : (int)mc;   // 2: unspecified
+}
+int mavc_bt709(const mavc *a, int h) { int mc = a->nsps ? sps_matrix(a->sps, (size_t)a->nsps) : -1; return mc < 0 ? h >= 720 : mc == 1; }
 
 static void keep_ps(mavc *a, const uint8_t *nal, size_t n) {   // a parameter set NAL unit (without start code)
     int t = nal[0] & 31; uint8_t *dst = t == 7 ? a->sps : a->pps; int *dn = t == 7 ? &a->nsps : &a->npps;

@@ -177,6 +177,277 @@ class Experimental(unittest.TestCase):
             os.environ.clear(); os.environ.update(environ); shutil.rmtree(t, ignore_errors=True)
 
 
+def _npdm(pid):   # an NPDM whose ACI0 section names this program ID (porter.dumpdir.program_id reads only that)
+    d = bytearray(0x100); d[:4] = b'META'; struct.pack_into('<II', d, 0x70, 0x80, 0x40); d[0x80:0x84] = b'ACI0'; struct.pack_into('<Q', d, 0x90, pid); return bytes(d)
+
+
+def _dump(root, app=0x0100000000AAA000, base_romfs=True, updates=(), dlc=()):   # a dump folder in upstream pack_dump.py's layout, with a few files in each tree
+    def version(d, pid, files):
+        (d / 'exefs').mkdir(parents=True); (d / 'exefs/main').write_bytes(b'NSO0' + bytes(pid & 0xff for _ in range(12))); (d / 'exefs/main.npdm').write_bytes(_npdm(pid))
+        for rel, data in files.items(): p = d / 'romfs' / rel; p.parent.mkdir(parents=True, exist_ok=True); p.write_bytes(data)
+    version(root / 'base', app, {'Movie/a.webm': b'base', 'x.bin': b'x'} if base_romfs else {})
+    for v in updates: version(root / f'updates/{v}', app, {'Movie/a.webm': b'patched', '._x.bin': b'appledouble', 'y.bin': b'y'})
+    for tid in dlc: p = root / f'dlc/{tid:016X}/0/romfs/d.bin'; p.parent.mkdir(parents=True); p.write_bytes(b'dlc')
+    return root
+
+
+class DumpFolder(unittest.TestCase):   # porter/dumpdir.py: a dump folder (base/exefs, base/romfs, updates/<version>/, dlc/) as upstream's scripts/pack_dump.py takes it
+    APP = 0x0100000000AAA000
+
+    def setUp(self): self.t = Path(tempfile.mkdtemp(prefix='nx2a_test_dump_'))
+    def tearDown(self): shutil.rmtree(self.t, ignore_errors=True); os.environ.pop('DM_GAMES_DIR', None)
+
+    def test_scan(self):   # the title ID from main.npdm, each update by its decimal version, each DLC by its title ID; the base is v0
+        from porter import dumpdir
+        d = _dump(self.t, updates=(917504, 65536), dlc=(self.APP + 0x1001,))
+        self.assertTrue(dumpdir.is_dump(d))
+        app, fam = dumpdir.scan(d)
+        self.assertEqual(app, self.APP); self.assertEqual([v for v, _ in fam['updates']], [65536, 917504])
+        self.assertEqual(fam['dlc'], [(self.APP + 0x1001, None, d / f'dlc/{self.APP + 0x1001:016X}/0/romfs')])
+        self.assertEqual(sorted(dumpdir.versions(fam)), ['v0', 'v65536', 'v917504'])
+
+    def test_update_alone(self):   # no base RomFS: the update's patched RomFS is whole, and the base is no version of its own (Mario Kart World's 1.8.0 NUP holds the update alone)
+        from porter import dumpdir
+        d = _dump(self.t, base_romfs=False, updates=(917504,))
+        self.assertTrue(dumpdir.is_dump(d)); self.assertEqual(list(dumpdir.versions(dumpdir.scan(d)[1])), ['v917504'])
+        self.assertFalse(dumpdir.is_dump(_dump(self.t / 'none', base_romfs=False)))   # no RomFS anywhere: not a dump
+
+    def test_refused(self):   # not a base title ID; an update of another program; a DLC of another game
+        from porter import dumpdir
+        with self.assertRaises(pipeline.BuildError): dumpdir.scan(_dump(self.t / 'a', app=self.APP + 0x800))
+        d = _dump(self.t / 'b', updates=(65536,)); (d / 'updates/65536/exefs/main.npdm').write_bytes(_npdm(self.APP + 0x2000))
+        with self.assertRaises(pipeline.BuildError): dumpdir.link_version(d / 'updates/65536', self.APP, self.t / 'out/v65536')
+        with self.assertRaises(pipeline.BuildError): dumpdir.scan(_dump(self.t / 'c', dlc=(0x0100000000BBB000 + 0x1001,)))
+
+    def test_link_version(self):   # the update's RomFS alone (never laid over the base), as hard links, hidden AppleDouble files left out; a second run reuses the trees
+        from porter import dumpdir
+        d = _dump(self.t, updates=(917504,)); out = self.t / 'build/extract/v917504'
+        dumpdir.link_version(d / 'updates/917504', self.APP, out)
+        self.assertEqual(sorted(str(p.relative_to(out / 'RomFS')) for p in (out / 'RomFS').rglob('*') if p.is_file()), ['Movie/a.webm', 'y.bin'])
+        self.assertEqual((out / 'RomFS/Movie/a.webm').read_bytes(), b'patched'); self.assertTrue((out / 'ExeFS/main').is_file())
+        if dumpdir.can_link(self.t): self.assertTrue(os.path.samefile(out / 'RomFS/y.bin', d / 'updates/917504/romfs/y.bin'))
+        ino = (out / 'RomFS').stat().st_ino
+        dumpdir.link_version(d / 'updates/917504', self.APP, out); self.assertEqual((out / 'RomFS').stat().st_ino, ino)   # reused
+        (d / 'updates/917504/romfs/z.bin').write_bytes(b'z'); dumpdir.link_version(d / 'updates/917504', self.APP, out)
+        self.assertTrue((out / 'RomFS/z.bin').is_file())   # a changed dump links again
+
+    def test_link_dlc(self):   # aoc/<index>/ with index = DLC title ID − base − 0x1000; a DLC gone from the dump goes from aoc/; none at all: no aoc/
+        from porter import dumpdir
+        aoc = self.t / 'build/aoc'; (aoc / '7').mkdir(parents=True)
+        dumpdir.link_dlc(self.APP, dumpdir.scan(_dump(self.t / 'd', dlc=(self.APP + 0x1003,)))[1]['dlc'], aoc)
+        self.assertEqual(sorted(p.name for p in aoc.iterdir() if p.is_dir()), ['3']); self.assertEqual((aoc / '3/d.bin').read_bytes(), b'dlc')
+        self.assertIsNone(dumpdir.link_dlc(self.APP, [], aoc)); self.assertFalse(aoc.exists())
+
+    def test_inspect(self):   # porter inspect on a dump folder needs no prod.keys; a version the profile does not register is packed from a derived profile
+        profile_dir([('status', 'experimental')], f'{self.APP:016X}')
+        info = pipeline.inspect(_dump(self.t, base_romfs=False, updates=(917504,)))
+        self.assertEqual((info['title_id'], info['versions'], info['pack'], info['derived']), (f'{self.APP:016X}', ['v917504'], 'v917504', True))
+
+
+def _nup(path, packages, standalone=True):
+    """packages: [(kind 0 base / 1 update / 2 DLC, title ID, version, {'exefs': {name: bytes}, 'romfs': {path: bytes}})] → a NUP file (SPEC v1, as upstream's
+    dm/tools/tests/test_nsp_nup.py writes them), every file of 200 bytes or more zstd-compressed; standalone: the updates' standalone_update flag"""
+    from porter.upstream import pack_nup
+    dirs, files, slots, pool = [], [], [], bytearray()
+    def walk(name, tree):   # folders pre-order, each one's children consecutive and sorted
+        d = len(dirs); dirs.append([name, 0, 0]); kids = sorted(tree.items(), key=lambda kv: kv[0].encode())
+        first = len(slots); slots.extend([None] * len(kids)); dirs[d][1:] = [first, len(kids)]
+        for j, (n, v) in enumerate(kids):
+            if isinstance(v, bytes): slots[first + j] = ('f', len(files)); files.append((n, v))
+        for j, (n, v) in enumerate(kids):
+            if isinstance(v, dict): slots[first + j] = ('d', walk(n, v))
+        return d
+    def nest(flat):
+        t = {}
+        for q, v in flat.items():
+            *ds, f = q.split('/'); c = t
+            for x in ds: c = c.setdefault(x, {})
+            c[f] = v
+        return t
+    recs = []
+    for kind, tid, ver, tree in packages:
+        t = {k: v if k == 'exefs' else nest(v) for k, v in tree.items()}; root = walk('', t)
+        sub = {n: q[1] for n, q in zip(sorted(t), slots[dirs[root][1]:dirs[root][1] + dirs[root][2]])}
+        recs.append((tid, root, sub.get('exefs', 0xFFFFFFFF), sub.get('romfs', 0xFFFFFFFF), ver, kind))
+    def name(x): b = x.encode(); off = len(pool); pool.extend(b); return off, len(b)
+    pool_off = 0x30 + len(recs) * 0x40 + len(dirs) * 0x18 + len(files) * 0x50 + len(slots) * 4
+    names_d, names_f = [name(d[0]) for d in dirs], [name(f[0]) for f in files]
+    toc_size = (pool_off + len(pool) + 15) // 16 * 16; pos = blob = 0x80 + toc_size; ext, blobs = [], []
+    for n, data in files:
+        stored, codec = (pack_nup.zstd.compress(data), 1) if len(data) >= 200 else (data, 0)
+        if not data: ext.append((0, 0, 0)); continue
+        ext.append((pos, len(stored), codec)); blobs.append((pos, stored)); pos = (pos + len(stored) + 15) // 16 * 16
+    toc = bytearray(struct.pack('<4sIQQQQQ', b'TOC\x01', len(recs), len(dirs), len(files), pool_off, len(pool), 0))
+    for tid, root, ex, ro, ver, kind in recs: toc += struct.pack('<QIIIIBBHIQI20x', tid, root, ex, ro, ver, kind, int(standalone and kind == 1), 0, 0, 0, 0)
+    for (o, ln), d in zip(names_d, dirs): toc += struct.pack('<IIIIQ', o, ln, d[1], d[2], 0)
+    for (o, ln), (n, data), (eo, es, c) in zip(names_f, files, ext): toc += struct.pack('<IIQQQ32sBBH12x', o, ln, len(data), eo, es, hashlib.sha256(data).digest(), c, 0, 0)
+    for k, i in slots: toc += struct.pack('<I', i if k == 'd' else len(dirs) + i)
+    toc += pool; toc += b'\0' * (toc_size - len(toc))
+    body = bytearray(pos); body[0x80:0x80 + toc_size] = toc
+    for o, b in blobs: body[o:o + len(b)] = b
+    body[:0x80] = struct.pack('<4sHHQQ32sQQII16s32s', b'NUP\x01', 0x80, 1, 0x80, toc_size, hashlib.sha256(toc).digest(), blob, pos, len(recs), 0, b'\x11' * 16, b'\0' * 32)
+    Path(path).write_bytes(body)
+    return Path(path)
+
+
+def _nup_version(pid, marker='Movie/a.webm', main=b'NSO0' + bytes(12)):
+    return {'exefs': {'main': main, 'main.npdm': _npdm(pid), '.listing': b'not a module'}, 'romfs': {marker: b'webm' * 100, 'Data/b.bin': b'b', 'empty': b''}}
+
+
+class NupInput(unittest.TestCase):   # a NUP container (upstream scripts/pack_nup.py): Mario Kart World 1.8.0's holds one standalone update and no base record
+    APP, VER = 0x0100000000AAA000, 917504
+
+    def setUp(self): self.t = Path(tempfile.mkdtemp(prefix='nx2a_test_nup_')); (self.t / 'game').mkdir()
+    def tearDown(self): shutil.rmtree(self.t, ignore_errors=True); os.environ.pop('DM_GAMES_DIR', None)
+
+    def nup(self, packages=None, **kw):
+        return _nup(self.t / 'game/Game [v1.8.1].nup', packages or [(1, self.APP, self.VER, _nup_version(self.APP))], **kw)
+
+    def test_scan_update_alone(self):   # no base record, standalone_update: the update is the whole game, there is no v0
+        from porter.upstream import nsp
+        p = self.nup()
+        self.assertEqual(nsp.nup_file(self.t / 'game'), p); self.assertEqual(nsp.nup_file(p), p)
+        app, fam = nsp.scan_nup(p)
+        try:
+            self.assertEqual((app, fam['base'], [v for v, _ in fam['updates']], fam['dlc']), (self.APP, None, [self.VER], []))
+            self.assertEqual(list(nsp.nsp_versions(fam, {})), [f'v{self.VER}'])
+        finally: fam['nup'].close()
+        with self.assertRaises(pipeline.BuildError): nsp.scan_nup(_nup(self.t / 'b.nup', [(1, self.APP, self.VER, _nup_version(self.APP))], standalone=False))   # an update of a base elsewhere
+
+    def test_nup_file_rules(self):   # an NSP beside it: the NSPs are what the player gave; two NUPs: one game per folder
+        from porter.upstream import nsp
+        p = self.nup()
+        (self.t / 'game/x.nsp').write_bytes(b'PFS0'); self.assertIsNone(nsp.nup_file(self.t / 'game')); (self.t / 'game/x.nsp').unlink()
+        shutil.copyfile(p, self.t / 'game/other.nup')
+        with self.assertRaises(pipeline.BuildError): nsp.nup_file(self.t / 'game')
+
+    def test_extract(self):   # ExeFS (dump-tool artifacts left out) and RomFS.img, which the second run keeps; the image holds every file of the container's RomFS
+        from porter.upstream import nsp, pack_nup
+        app, fam = nsp.scan_nup(self.nup())
+        try:
+            ex = self.t / 'build/extract'; k = fam['updates'][0][1]
+            d = nsp.extract_nup(ex, f'v{self.VER}', k, None, app, fam['nup'])
+            self.assertEqual(sorted(p.name for p in (d / 'ExeFS').iterdir()), ['main', 'main.npdm'])
+            idx = pack_nup.romfs_image.read_index(str(d / 'RomFS.img'))
+            self.assertEqual({q: v[2] for q, v in idx.items() if not v[0]}, {'Movie/a.webm': 400, 'Data/b.bin': 1, 'empty': 0})
+            ident = pack_nup.romfs_image.file_identity(d / 'RomFS.img')
+            nsp.extract_nup(ex, f'v{self.VER}', k, None, app, fam['nup']); self.assertEqual(pack_nup.romfs_image.file_identity(d / 'RomFS.img'), ident)   # reused
+            self.assertEqual(pipeline.romfs_of(d), d / 'RomFS.img')
+        finally: fam['nup'].close()
+
+    def test_dlc(self):   # aoc/<index>.img, index = DLC title ID − base − 0x1000; the data pack lists it
+        from porter.upstream import nsp
+        app, fam = nsp.scan_nup(self.nup([(1, self.APP, self.VER, _nup_version(self.APP)), (2, self.APP + 0x1002, 0, {'romfs': {'d.bin': b'dlc'}})]))
+        try: aoc = nsp.extract_aoc(None, None, pipeline.NXNATIVE, self.t / 'build', app, fam, self.t / 'logs')
+        finally: fam['nup'].close()
+        self.assertTrue((aoc / '2.img').is_file())
+
+    def test_inspect(self):   # porter inspect needs no keys for a NUP; no base game: no v0, and the version is packed from a derived profile
+        profile_dir([('status', 'experimental')], f'{self.APP:016X}'); self.nup()
+        info = pipeline.inspect(self.t / 'game')
+        self.assertEqual((info['kind'], info['needs_keys'], info['base'], info['versions'], info['pack'], info['derived']), ('nup', False, None, [f'v{self.VER}'], f'v{self.VER}', True))
+        self.assertIn('note', info)
+
+    def test_space(self):   # the image is written once and linked into the data pack: the RomFS once, less what the build folder holds, plus 1 GB
+        from types import SimpleNamespace as NS
+        from porter.upstream import nsp
+        app, fam = nsp.scan_nup(self.nup())
+        p = NS(o=NS(folder=self.t / 'game'), work=self.t / 'game/build', dump=False, nup=True, fam=fam, have={f'v{self.VER}': fam['updates'][0][1]}, versions=[f'v{self.VER}'])
+        real = shutil.disk_usage
+        try:
+            shutil.disk_usage = lambda _: NS(free=2**30 + 400); pipeline.Port.check_space(p)
+            shutil.disk_usage = lambda _: NS(free=2**30 + 300)
+            if pipeline.dumpdir.can_link(p.work):
+                with self.assertRaises(pipeline.BuildError): pipeline.Port.check_space(p)
+        finally: shutil.disk_usage = real; fam['nup'].close()
+
+    def test_data_pack_image(self):   # RomFS.img linked into the pack, its reuse stamp still holding after the link (a hard link changes the ctime the stamp holds); the stamps stay out
+        from porter.upstream import nsp, pack_nup
+        app, fam = nsp.scan_nup(self.nup([(1, self.APP, self.VER, _nup_version(self.APP)), (2, self.APP + 0x1001, 0, {'romfs': {'d.bin': b'dlc'}})]))
+        try:
+            d = nsp.extract_nup(self.t / 'build/extract', f'v{self.VER}', fam['updates'][0][1], None, app, fam['nup'])
+            aoc = nsp.extract_aoc(None, None, pipeline.NXNATIVE, self.t / 'build', app, fam, self.t / 'logs')
+            (self.t / 'patched').mkdir(); (self.t / 'patched/main.patched.bin').write_bytes(b'x'); (self.t / 'shaders.dmsv').write_bytes(b'DMSV')
+            man = datapack.build(self.t / 'out-data', profile=profiles.load(NEO), version=f'v{self.VER}', display='1.8.0', patched=self.t / 'patched', romfs=pipeline.romfs_of(d),
+                                 shaders=self.t / 'shaders.dmsv', aoc=aoc)
+            o = self.t / 'out-data'
+            self.assertEqual(sorted(p.name for p in o.iterdir() if p.name not in ('env.txt', 'settings.txt', datapack.MANIFEST)), ['RomFS.img', 'aoc', 'mods', 'shaders.dmsv'])
+            self.assertEqual([p.name for p in (o / 'aoc').iterdir()], ['1.img']); self.assertEqual((man['romfs'], man['dlc']), ('image', [1]))
+            if pipeline.dumpdir.can_link(self.t): self.assertTrue(os.path.samefile(o / 'RomFS.img', d / 'RomFS.img'))
+            datapack.build(self.t / 'out-data', profile=profiles.load(NEO), version=f'v{self.VER}', display='1.8.0', patched=self.t / 'patched', romfs=pipeline.romfs_of(d),
+                           shaders=self.t / 'shaders.dmsv', aoc=aoc)   # again: the older pack's links go, which changes the ctime once more
+            img = str(d / 'RomFS.img'); ident = pack_nup.romfs_image.file_identity(img)
+            self.assertEqual(json.loads(Path(img + '.inputs.json').read_text())['image'], ident)
+            shutil.rmtree(self.t / 'out-data'); datapack.renew_stamp(img)   # the pack deleted by hand: the port renews the stamp before the extraction
+            ident = pack_nup.romfs_image.file_identity(img)
+            nsp.extract_nup(self.t / 'build/extract', f'v{self.VER}', fam['updates'][0][1], None, app, fam['nup'])
+            self.assertEqual(pack_nup.romfs_image.file_identity(img), ident)   # not written again
+            os.utime(img, ns=(1, 1)); datapack.renew_stamp(img)   # another mtime: the stamp stays void, and the image is written again
+            nsp.extract_nup(self.t / 'build/extract', f'v{self.VER}', fam['updates'][0][1], None, app, fam['nup'])
+            self.assertNotEqual(pack_nup.romfs_image.file_identity(img)[1], ident[1])
+        finally: fam['nup'].close()
+
+
+    def test_derived_modules(self):   # a derived profile names the modules its version ships (Mario Kart World 1.0.0 has no subsdk1, 1.8.0 has), each in its build row
+        from porter.upstream import nsp
+        g0 = profile_dir([('status', 'experimental')], f'{self.APP:016X}')
+        (g0 / 'game.tsv').write_text((g0 / 'game.tsv').read_text().replace('modules\tmain sdk', 'modules\tmain subsdk0 subsdk1 sdk') + 'build\tv0\t1.0.0\tmain=' + '11' * 16 + '\n', encoding='utf-8')
+        g = game.load(f'{self.APP:016X}')
+        for ver, mods in (('v65536', ('main', 'subsdk0', 'sdk')), ('v917504', ('main', 'subsdk0', 'subsdk1', 'sdk'))):
+            d = self.t / ver; (d / 'ExeFS').mkdir(parents=True)
+            for i, m in enumerate(mods): (d / 'ExeFS' / m).write_bytes(b'NSO0' + bytes(0x3c) + bytes([i + 1]) * 16)
+            nsp.derive_profile(g, self.t / 'derived' / ver / g.id, ver, d, g.words('modules'))
+            rows = [l.split('\t') for l in (self.t / 'derived' / ver / g.id / 'game.tsv').read_text().splitlines() if l and not l.startswith('#')]
+            self.assertEqual(next(r[1:] for r in rows if r[0] == 'modules'), [' '.join(mods)])
+            self.assertEqual([c.split('=')[0] for c in next(r for r in rows if r[0] == 'build')[3:]], list(mods))
+
+
+class PushFile(unittest.TestCase):   # porter/adb.py push_file: pieces appended on the device as they arrive, resumable by the partial copy's size (a fake device: a local folder)
+    class FakeAdb(pipeline.Adb):
+        def __init__(self, dev): super().__init__('adb', log=lambda s: None); self.dev, self.pushes = Path(dev), 0
+        def at(self, p): return self.dev / p.lstrip('/')
+        def run(self, *a, **kw):
+            assert a[:2] == ('push', '-Z'); q = self.at(a[3]); q.parent.mkdir(parents=True, exist_ok=True); shutil.copyfile(a[2], q); self.pushes += 1; return ''
+        def shell(self, script, **kw):
+            if m := re.match(r'mkdir -p (\S+) .*!= (\S+) \].* stat -c %s (\S+) 2>/dev/null', script):   # the set-up: other partial copies of this file go; the partial copy's size
+                d = self.at(m[1]); d.mkdir(parents=True, exist_ok=True)
+                for x in d.glob('.dmpart-*'):
+                    if x.name != m[2]: shutil.rmtree(x) if x.is_dir() else x.unlink()
+                q = self.at(m[3]); return f'{q.stat().st_size}\n' if q.is_file() else 'none\n'
+            if m := re.fullmatch(r'truncate -s (\d+) (\S+)', script): os.truncate(self.at(m[2]), int(m[1])); return ''
+            if m := re.fullmatch(r'cat (\S+) >> (\S+) && rm -f \S+ && stat -c %s \S+', script):
+                with open(self.at(m[2]), 'ab') as f: f.write(self.at(m[1]).read_bytes())
+                self.at(m[1]).unlink(); return f'{self.at(m[2]).stat().st_size}\n'
+            if m := re.fullmatch(r'mv -f (\S+) (\S+) && stat -c %s \S+', script): os.replace(self.at(m[1]), self.at(m[2])); return f'{self.at(m[2]).stat().st_size}\n'
+            raise AssertionError(script)
+
+    def test_push_and_resume(self):
+        t = Path(tempfile.mkdtemp(prefix='nx2a_test_push_'))
+        try:
+            src = t / 'RomFS.img'; src.write_bytes(random.Random(1).randbytes(2500))
+            adb = self.FakeAdb(t / 'dev'); dst = '/sdcard/files/RomFS.img'; files = adb.at('/sdcard/files')
+            adb.push_file(src, dst, chunk=1000)
+            self.assertEqual((adb.at(dst).read_bytes(), adb.pushes), (src.read_bytes(), 3)); self.assertEqual([p.name for p in files.iterdir()], ['RomFS.img'])   # no partial copy or piece left
+            # an interrupted push: 1.5 pieces in its partial copy (cut back to 1, then pieces 2 and 3), and a partial copy of another file, which goes
+            tag, st = hashlib.sha1(dst.encode()).hexdigest()[:12], src.stat()
+            ours = files / f'.dmpart-{tag}-{hashlib.sha1(f"{st.st_size}:{st.st_mtime_ns}".encode()).hexdigest()[:8]}'
+            adb.at(dst).unlink(); ours.write_bytes(src.read_bytes()[:1500]); (files / f'.dmpart-{tag}-deadbeef').write_bytes(b'old'); (files / f'.dmpart-{tag}').mkdir()
+            adb.pushes = 0; adb.push_file(src, dst, chunk=1000)
+            self.assertEqual((adb.at(dst).read_bytes(), adb.pushes), (src.read_bytes(), 2)); self.assertEqual([p.name for p in files.iterdir()], ['RomFS.img'])
+            ours.write_bytes(src.read_bytes()); adb.pushes = 0; adb.push_file(src, dst, chunk=1000)   # a whole partial copy: renamed, nothing pushed
+            self.assertEqual((adb.at(dst).read_bytes(), adb.pushes), (src.read_bytes(), 0))
+            empty = t / 'empty.bin'; empty.write_bytes(b''); adb.push_file(empty, '/sdcard/files/empty.bin'); self.assertEqual(adb.at('/sdcard/files/empty.bin').read_bytes(), b'')
+        finally: shutil.rmtree(t, ignore_errors=True)
+
+    def test_push_need(self):   # what the device lacks at its size, plus one piece
+        from porter import install
+        t = Path(tempfile.mkdtemp(prefix='nx2a_test_need_'))
+        try:
+            (t / 'RomFS.img').write_bytes(b'x' * 100); (t / 'mods').mkdir(); (t / 'mods/main').write_bytes(b'y' * 10)
+            self.assertEqual(install.push_need(t, {'RomFS.img': 100, 'mods/main': 9}), 10 + (64 << 20))
+        finally: shutil.rmtree(t, ignore_errors=True)
+
+
 class Misc(unittest.TestCase):
     def test_config_roundtrip(self):
         config.set_value('device', 'abc:5555'); self.assertEqual(config.load()['device'], 'abc:5555')
@@ -275,7 +546,8 @@ class Misc(unittest.TestCase):
             self.assertIn('2 registered patches (dm/tools/sdk_patches.py: AddressRegionManager constructor)', lost[0])
             table['bb' * 16] = ('dm/tools/sdk_patches.py', ['z'])   # the derived build has cuts of its own
             self.assertEqual(pipeline.lost_patches(builds, d, ['main', 'sdk', 'subsdk0'], table), [])
-            self.assertIn('6075151627016eef437c1312f2e3ed56', pipeline.registered_patches())   # the real files load
+            real = pipeline.registered_patches()   # the real files load (the SDK-wide rules, sdk_patches.py MATCH_CUTS, are matched by code, not by build: not in the table)
+            self.assertTrue(any(f == 'dm/tools/sdk_patches.py' for f, _ in real.values()) and any(f.startswith('dm/games/') for f, _ in real.values()))
         finally: shutil.rmtree(d, ignore_errors=True)
 
     def test_app_stem(self):

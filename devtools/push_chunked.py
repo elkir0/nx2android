@@ -1,4 +1,4 @@
-# Push a local tree or one file to the device in short transfers (porter/adb.py: small files in batches, big files in pieces the device joins; a rerun resumes).
+# Push a local tree or one file to the device in short transfers (porter/adb.py: small files in batches, big files in pieces appended on the device as they arrive; a rerun resumes).
 #   push_chunked.py <local dir or file> <remote dir or file> [--chunk-mb N] [--timeout S]      (devtools/device.json: the device)
 import os, sys
 from pathlib import Path

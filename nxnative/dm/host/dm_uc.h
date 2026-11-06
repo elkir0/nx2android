@@ -6,14 +6,15 @@
 #pragma once
 #include <signal.h>
 #include <stdint.h>
-#include <ucontext.h>
 #if defined(__APPLE__)
+#include <sys/ucontext.h>   // <ucontext.h> is the deprecated routines' header on Darwin, refused without _XOPEN_SOURCE
 #define DM_UC_SS(uc) (&(uc)->uc_mcontext->__ss)
 #define DM_UC_V(uc) ((uc)->uc_mcontext->__ns.__v)
 #define DM_UC_FPSR(uc) ((uc)->uc_mcontext->__ns.__fpsr)
 #define DM_UC_FPCR(uc) ((uc)->uc_mcontext->__ns.__fpcr)
 #define DM_UC_ESR(uc) ((uc)->uc_mcontext->__es.__esr)
 #else
+#include <ucontext.h>
 #include <mach/mach.h>   // struct __darwin_arm_thread_state64 (dm/android/compat)
 #include <asm/sigcontext.h>
 _Static_assert(__builtin_offsetof(struct sigcontext, pc) - __builtin_offsetof(struct sigcontext, regs) == __builtin_offsetof(struct __darwin_arm_thread_state64, __pc), "sigcontext layout");

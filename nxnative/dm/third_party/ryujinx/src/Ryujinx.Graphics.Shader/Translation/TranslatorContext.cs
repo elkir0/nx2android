@@ -36,6 +36,7 @@ namespace Ryujinx.Graphics.Shader.Translation
 
         private bool IsTransformFeedbackEmulated => !GpuAccessor.QueryHostSupportsTransformFeedback() && GpuAccessor.QueryTransformFeedbackEnabled();
         public bool HasStore => _program.UsedFeatures.HasFlag(FeatureFlags.Store) || (IsTransformFeedbackEmulated && Definitions.LastInVertexPipeline);
+        internal bool UsesViewportMask => _program.UsedFeatures.HasFlag(FeatureFlags.ViewportMask);
 
         public bool LayerOutputWritten { get; private set; }
         public int LayerOutputAttribute { get; private set; }
@@ -175,6 +176,9 @@ namespace Ryujinx.Graphics.Shader.Translation
         }
 
         private bool _nextStageMerged;
+
+        // nx2android: the words a workgroup takes of the storage buffer that holds its shared memory (ShaderProperties.SharedMemorySpillWords), 0 when it lies in workgroup memory
+        public int SharedMemorySpillWords { get; private set; }
 
         public void SetNextStage(TranslatorContext nextStage)
         {
@@ -367,6 +371,60 @@ namespace Ryujinx.Graphics.Shader.Translation
                 clipDistancesWritten,
                 originalDefinitions.OmapTargets);
 
+            // nx2android: a task or mesh shader written as the Vulkan stage around its body (CodeGen/Spirv/MeshStage.cs). A task shader, and a mesh shader the draw launches itself,
+            // number their workgroups from the draw's first (NVN2's DrawMeshTasks first): a uniform buffer the host fills holds it in word 0
+            MeshStageInfo meshStage = Definitions.Stage == ShaderStage.Compute ? GpuAccessor.QueryHostMeshStage() : null;
+
+            if (meshStage != null)
+            {
+                resourceManager.Properties.MeshStage = meshStage;
+
+                if (meshStage.IsTask || !meshStage.HasTask)
+                {
+                    SetBindingPair first = GpuAccessor.CreateConstantBufferBinding(-1);
+                    resourceManager.Properties.AddOrUpdateConstantBuffer(new BufferDefinition(BufferLayout.Std140, first.SetIndex, first.Binding, "mesh_first",
+                        new StructureType([new StructureField(AggregateType.Vector4 | AggregateType.U32, "first")])));
+                    resourceManager.Properties.MeshFirstBinding = first.Binding;
+                }
+            }
+
+            // nx2android: float min / max / clamp with Maxwell's NaN rule (IGpuAccessor.QueryHostNanSafeMinMax)
+            resourceManager.Properties.NanSafeMinMax = GpuAccessor.QueryHostNanSafeMinMax();
+            resourceManager.Properties.HmmaF16 = GpuAccessor.QueryHostHmmaF16();
+
+            // nx2android: shared memory past what the host gives a workgroup (IGpuAccessor.QueryHostSharedMemoryLimit) is taken from a storage buffer, a slice of all the
+            // shared memories a workgroup. Mario Kart World's DrivePassShaderDefault declares 48 KB in 168 compute shaders, where Adreno gives 32 KB; Vulkan refuses such a pipeline
+            int sharedLimit = GpuAccessor.QueryHostSharedMemoryLimit();
+            int sharedWords = 0;
+
+            foreach (MemoryDefinition memory in resourceManager.Properties.SharedMemories.Values)
+            {
+                sharedWords += memory.Type == (AggregateType.Array | AggregateType.U32) ? memory.ArrayLength : int.MaxValue / 8;
+            }
+
+            if (sharedLimit > 0 && sharedWords * 4L > sharedLimit && Definitions.Stage == ShaderStage.Compute)
+            {
+                if (meshStage != null || sharedWords >= int.MaxValue / 8)
+                {
+                    throw new NotSupportedException($"{sharedWords * 4L} bytes of shared memory past the host's {sharedLimit} in a shader whose shared memory cannot move to a buffer.");
+                }
+
+                SetBindingPair spill = GpuAccessor.CreateStorageBufferBinding(-1);
+                resourceManager.Properties.AddOrUpdateStorageBuffer(new BufferDefinition(BufferLayout.Std430, spill.SetIndex, spill.Binding, "shared_spill",
+                    new StructureType([new StructureField(AggregateType.Array | AggregateType.U32, "data", 0)])));
+
+                // The first words can stay in workgroup memory (IGpuAccessor.QueryHostSharedMemorySpillKeep, one shared memory). Those 168 shaders build 3x4 matrices (48-byte
+                // records, from quaternions) at the invocation's global index: 84 then combine each with the record a uniform buffer names, a barrier per step; 84 keep a run of
+                // records at index x count + i, with no barrier. The first workgroups of a dispatch never reach the buffer then. Each access tests its word (SharedMemorySpill.Split)
+                int keepWords = resourceManager.Properties.SharedMemories.Count == 1 ? Math.Clamp(Math.Min(GpuAccessor.QueryHostSharedMemorySpillKeep(), sharedLimit) / 4, 0, sharedWords) : 0;
+
+                resourceManager.Properties.SharedMemorySpillBinding = spill.Binding;
+                resourceManager.Properties.SharedMemorySpillWords = sharedWords - keepWords;
+                resourceManager.Properties.SharedMemorySpillKeep = keepWords;
+                resourceManager.Properties.SharedMemorySpillSlices = Math.Max(1, GpuAccessor.QueryHostSharedMemorySpillSlices());
+                SharedMemorySpillWords = sharedWords - keepWords;
+            }
+
             HostCapabilities hostCapabilities = new HostCapabilities(
                 GpuAccessor.QueryHostReducedPrecision(),
                 GpuAccessor.QueryHostSupportsFragmentShaderInterlock(),
@@ -377,7 +435,8 @@ namespace Ryujinx.Graphics.Shader.Translation
                 GpuAccessor.QueryHostSupportsShaderFloat64(),
                 GpuAccessor.QueryHostSupportsShaderNonUniformIndexing(),
                 GpuAccessor.QueryHostSupportsTextureShadowLod(),
-                GpuAccessor.QueryHostSupportsViewportMask());
+                GpuAccessor.QueryHostSupportsViewportMask(),
+                Options.Flags.HasFlag(TranslationFlags.MetalImageAtomics));
 
             CodeGenParameters parameters = new CodeGenParameters(attributeUsage, definitions, resourceManager.Properties, hostCapabilities, GpuAccessor, Options.TargetApi);
 

@@ -13,6 +13,8 @@
 #   or in a terminal: python3 scripts/build_ipa_from_nsp.py <NSP folder> -k <prod.keys> [options] (values given on the command line override "Settings", -h lists every option;
 #   without keyboard input a missing value is not asked for but reported as an error; exit code 0 on success, 1 on error, 130 when interrupted). Command-line options entered in Spyder's run configuration work the same way.
 # Uses only three things: this repository, a folder holding one game's NSPs (the base game, with or without an update; DLC NSPs, when present, are packed too and unlock the add-on content already in the game), and prod.keys.
+#   A NUP container (a .nup file: base game, updates and DLC, unencrypted; scripts/pack_nup.py) may stand for the NSPs: nup_file / scan_nup / extract_nup / extract_aoc unpack it with no keys into
+#   extract/v<version>/{ExeFS, RomFS.img} and aoc/<index>.img (the RomFS as one image, dm/tools/romfs_image.py); the Android porter takes them (this script's main still reads NSPs only).
 #   The newest version in the folder is packed. A version the profile registers (with every version in its shader_versions in the folder) is built from the profile as it is; any other
 #   version (the base game alone, another update) from a profile derived from it in <id>_build/profile: the same settings, and the version's own shaders (derive_profile).
 # Every intermediate file is under <id>_build/ in the NSP folder: extract/ (the extracted game files, kept for the next build unless KEEP_EXTRACTED / --no-keep-extracted), aoc/ (each DLC's RomFS by index), tools/ (nx_extract, and the Mac host for a run-time shader capture), patched_*/, shader/ (shader package and caches, kept so the next build is fast), logs/ (each step's full output), tmp/, ipa/. The finished IPA also goes to the NSP folder by default.
@@ -27,6 +29,8 @@
 # The console shows one line per stage ([k/n] stage, with a bar, done/total, percent, elapsed time and ETA where the work can be counted); the tools' own output goes only to logs/ (PROGRESS / --progress). --progress json writes newline-delimited JSON events to stdout.
 import ast, collections, ctypes, getpass, hashlib, json, os, re, shlex, shutil, struct, subprocess, sys, tempfile, threading, time, types, zlib
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import pack_nup   # a game in a NUP container instead of NSPs (upstream 423a6745, 777a5f6c): its versions become extract/v<N>/{ExeFS, RomFS.img}, with no keys
 
 # ---- Settings ----
 NSP_DIR = ''                            # folder holding the NSPs (empty = ask at run time)
@@ -477,9 +481,9 @@ def vnum(ver):   # 'v655360' → 655360
 
 
 def nsp_versions(fam, builds):
-    """The versions the folder holds: {version: its update NSP, or None for v0 (the base game alone)}. An update is known by the [v<N>] tag in its file name; a single update without one
+    """The versions the folder holds: {version: its update NSP, or None for v0 (the base game alone; a NUP may have no base game, then no v0)}. An update is known by the [v<N>] tag in its file name; a single update without one
     is taken for the newest update the profile registers (its build IDs are checked once extracted), and is left out when the profile registers none or other updates are there"""
-    out = {'v0': None}
+    out = {'v0': None} if fam['base'] is not None else {}
     for v, p in fam['updates']:
         if v is not None: out[f'v{v}'] = p
     loose = [p for v, p in fam['updates'] if v is None]
@@ -490,14 +494,50 @@ def nsp_versions(fam, builds):
 
 
 def pick_nsps(fam, have, versions):
-    """For each version to extract, (base game, update or None): v0 = the base game alone, v<N> = the base game + the update with version number N"""
-    say(f'base: {fam["base"].name}')
+    """For each version to extract, (base game, update or None): v0 = the base game alone, v<N> = the base game + the update with version number N. A NUP may have no base game: (None, update)"""
+    if fam['base'] is not None: say(f'base: {fam["base"].name}')
     out = {}
     for ver in versions:
         if ver not in have: raise BuildError(f'no NSP for update {ver} (the game profile needs these versions: {", ".join(versions)})')
         if have[ver]: say(f'update {ver}: {have[ver].name}')
         out[ver] = (fam['base'], have[ver])
     return out
+
+
+# ---- A NUP container (scripts/pack_nup.py) instead of NSPs: base game, updates and DLC in one unencrypted file, so no keys ----
+def nup_file(path, exts=('nsp', 'xci')):   # the NUP to pack: path when it is a .nup file, else the one .nup in the folder when no game package (exts) is beside it; None when there is none
+    path = Path(path)
+    if path.is_file():
+        if not pack_nup.is_nup(path): raise BuildError(f'not a folder or a NUP file: {path}')
+        return path
+    if any(p.suffix.lower()[1:] in exts for p in path.iterdir() if p.is_file()): return None
+    nups = sorted(p for p in path.iterdir() if p.is_file() and p.suffix.lower() == '.nup' and pack_nup.is_nup(p))
+    if len(nups) > 1: raise BuildError(f'more than one NUP in {path}: {", ".join(p.name for p in nups)}; keep one game per folder, or give the .nup file to pack in place of the folder')
+    return nups[0] if nups else None
+
+
+def scan_nup(path, want=None):   # a NUP as scan_nsps gives a folder of NSPs, with its packages for the NSPs: (title ID, {'base', 'updates', 'dlc', 'nup': the open container})
+    try:
+        n = pack_nup.Nup(path)
+        app, base, vers, dlc = pack_nup.scan(n)
+    except (pack_nup.Error, OSError) as e: raise BuildError(str(e)) from e
+    if want is not None and want != app: raise BuildError(f'no game {want:016X} in {path}, which holds {app:016X}')
+    return app, {'base': base, 'updates': sorted(vers.items()), 'dlc': [(tid, None, k) for tid, k in sorted(dlc.items())], 'nup': n}
+
+
+def extract_nup(ex, name, k, base, app, n):   # one version of a NUP (k: its base or an update package) into the layout extract makes; the code modules and the image are kept while unchanged
+    dst = ex / name; part = dst / 'RomFS.img.part'
+    def poll():
+        try: return {'done': part.stat().st_size}
+        except OSError: return None
+    ident = lambda: pack_nup.romfs_image.file_identity(dst / 'RomFS.img') if (dst / 'RomFS.img').is_file() else None
+    was = ident()
+    try:
+        PROG.stage(f'unpack {name}', poll=poll, unit='B', total=n.tree_bytes(pack_nup.romfs_of(k, base)), est=True)
+        pack_nup.pack_version(n, k, base, app, dst, say=lambda s: None)
+    except pack_nup.Error as e: raise BuildError(str(e)) from e
+    PROG.end(amount((dst / 'RomFS.img').stat().st_size, 'B') + (', reused (the same container and packer)' if was and was == ident() else ''))
+    return dst
 
 
 def can_clone(d):   # whether this volume supports APFS clones (nx_extract uses them to save space; without them it writes full copies)
@@ -683,6 +723,10 @@ def derive_profile(g, pdir, ver, d, mods):
     out, put = [f'# Derived from game profile {g.dir} by scripts/build_ipa_from_nsp.py for {ver} ({disp}), a version that profile was not brought up on:',
                 '# its keys as they are, this version\'s build row, and shader tables made from this version\'s own files'], False
     for line in (g.dir / 'game.tsv').read_text(encoding='utf-8').splitlines():
+        if line.split(T, 1)[0] == 'modules' and (d / 'ExeFS').is_dir():   # the modules this version ships (upstream c6e45e14, 1d4b8e82: a game's versions may differ in modules)
+            want = line.partition(T)[2].split(); have = [m for m in want if (d / 'ExeFS' / m).exists()]
+            if have != want:   # a module this version does not ship (Mario Kart World 1.0.0 has no subsdk1, the C library module of 1.8.0): left in, the rewrite stopped on the missing file
+                out += [f'# this version ships no {" ".join(m for m in want if m not in have)}', f'modules{T}{" ".join(have)}']; continue
         if line.split(T, 1)[0] in ('build', 'package', 'shader_versions'):
             if not put: out += [row, f'package{T}{ver}', f'shader_versions{T}{ver}']; put = True
             continue
@@ -717,6 +761,8 @@ def fingerprint(*items, env=None):
                 h.update(p.name.encode() + b'\0')
                 try: h.update(hashlib.sha256(p.read_bytes()).digest())
                 except OSError: h.update(b'missing')
+        elif kind in ('tree', 'stat') and os.path.isfile(v):   # a RomFS image (RomFS.img, pack_nup.py) for a folder: its size and time, as the packer writes it again only for other inputs
+            st = os.stat(v); h.update(f'{Path(v).name}\0{st.st_size}\0{st.st_mtime_ns}\n'.encode())
         elif kind in ('tree', 'stat'):
             for rel, st in files_under(v): h.update(f'{rel}\0{st.st_size}\0{st.st_mtime_ns if kind == "stat" else ""}\n'.encode())
         elif kind == 'cmd':
@@ -803,8 +849,15 @@ def extract(nx, keys, ex, name, base, upd, cmp_dir, logs, g):   # the build IDs 
 
 def extract_aoc(nx, keys, repo, work, app, fam, logs):
     """DLC NSPs in the folder → <id>_build/aoc/<index>/ (the RomFS of each one's data NCA; index = title ID − base − 0x1000). The host reports these indices as owned and mounts them (DM_AOC_DIR).
-    Returns None without DLC. Reused when the DLC NSPs (names, sizes and times) and nx_extract's sources are as at the last extraction (Monster Hunter Rise: 250 DLC, 30 s)"""
+    Returns None without DLC. Reused when the DLC NSPs (names, sizes and times) and nx_extract's sources are as at the last extraction (Monster Hunter Rise: 250 DLC, 30 s),
+    and aoc/ holds the files that extraction wrote (names, sizes and times): a NUP packs its DLC into the same aoc/, as aoc/<index>.img (pack_nup.pack_dlc)"""
     if not fam['dlc']: return None
+    if fam.get('nup'):
+        PROG.stage('unpack DLC', step='unpacking')
+        try: pack_nup.pack_dlc(fam['nup'], app, {tid: k for tid, _, k in fam['dlc']}, work / 'aoc', say=lambda s: None)
+        except pack_nup.Error as e: raise BuildError(str(e)) from e
+        PROG.end(f'{len(fam["dlc"])} DLC')
+        return work / 'aoc'
     tmp, dst = work / 'aoc.partial', work / 'aoc'; rmtree(tmp)
     best = {}   # when one DLC comes in several copies, take the highest version, and the largest of equal versions
     for tid, ver, p in fam['dlc']:
@@ -813,7 +866,7 @@ def extract_aoc(nx, keys, repo, work, app, fam, logs):
     PROG.stage('extract DLC')
     kf = work / 'aoc.key'
     key = fingerprint(sorted((tid, p.name, p.stat().st_size, p.stat().st_mtime_ns) for tid, (_, p) in best.items()), ('files', [repo / 'dm/tools/nx_extract' / f for f in ('Program.cs', 'nx_extract.csproj')]))
-    if dst.is_dir() and (note := reused(kf, key)) is not None:
+    if dst.is_dir() and (note := reused(kf, fingerprint(key, ('stat', dst)))) is not None:
         PROG.end(f'{note}, reused (inputs unchanged)'); return dst
     rmtree(kf)
     for i, (tid, (_, p)) in enumerate(sorted(best.items())):
@@ -822,7 +875,7 @@ def extract_aoc(nx, keys, repo, work, app, fam, logs):
         say(f'DLC index {idx}: {p.name}')
         run([nx, keys, '--aoc', p, tmp / str(idx)], logs / f'aoc_{idx}.log')
     swap_in(tmp, dst)
-    kf.write_text(f'{key}\n{len(best)} DLC\n')
+    kf.write_text(f'{fingerprint(key, ("stat", dst))}\n{len(best)} DLC\n')
     PROG.end(f'{len(best)} DLC')
     return dst
 
@@ -833,11 +886,24 @@ def build_mismatch(d, name, g):   # the modules of an extraction whose build ID 
     return [f'{m} {build_id(d / "ExeFS" / m)} (registered {bid})' for m, bid in want.items() if m != 'display' and build_id(d / 'ExeFS' / m) != bid]
 
 
-def patch_files(repo, exe_dir, mods):
+def patch_files(repo, exe_dir, mods, game_id=None):
     """The patch files that name one of the modules' builds (dm/tools/sdk_patches.py, dm/games/*/patches.py): patch_nso.py loads them all but applies only those of a module's
-    build ID, so another game's patches do not change this game's rewrite"""
+    build ID. The selected game's file also counts for unknown builds: it may supply MATCH_CUTS. Another game's rules do not change this game's rewrite. sdk_patches.py always counts:
+    its MATCH_CUTS are SDK-wide and apply to builds it does not name. The patches.py of profiles in DM_GAMES_DIR (a provisional profile's) count too, as patch_nso.py loads them (upstream ed0360b2)"""
     ids = {build_id(exe_dir / m) for m in mods}
-    return [p for p in [repo / 'dm/tools/sdk_patches.py'] + sorted((repo / 'dm/games').glob('*/patches.py')) if any(i in p.read_text(errors='replace') for i in ids)]
+    selected = Path(game_id).name if game_id else None
+    extra = [p for d in os.environ.get('DM_GAMES_DIR', '').split(os.pathsep) if d for p in sorted(Path(d).glob('*/patches.py'))]
+    sdk_wide = repo / 'dm/tools/sdk_patches.py'
+    files = {}
+    for p in [sdk_wide] + sorted((repo / 'dm/games').glob('*/patches.py')) + extra: files.setdefault(p.resolve(), p)
+    return [p for p in files.values()
+            if p == sdk_wide or p.parent.name == selected or any(i in p.read_text(errors='replace') for i in ids)]
+
+
+def romfs_source(d):   # an extraction's RomFS: its image (RomFS.img, a NUP's: pack_nup.py) as a path its readers walk into (dm/tools/romfs.py), else its RomFS folder
+    if not (Path(d) / 'RomFS.img').is_file(): return Path(d) / 'RomFS'
+    import romfs   # dm/tools: read-only paths inside a RomFS image
+    return romfs.source(d)
 
 
 def collect_nros(py, repo, romfs, dst, env, logs):
@@ -861,31 +927,41 @@ def collect_nros(py, repo, romfs, dst, env, logs):
 
 def rewrite(py, repo, exe_dir, out, env, logs, g):
     """patch_nso.py on every code module (each writes its own <module>.* files, all the same build_src.sha256 line), each with its log, as many at once as the Mac has cores.
-    The modules are the profile's and the NROs the game registers (collect_nros; nro.tsv beside them lists those). Reused when the modules, patch_nso.py (with nso_code.py, nso_asm.py
-    and the patch files of their builds), its switch and capstone are as at the last successful rewrite (Monster Hunter Rise's main alone takes 5.5 min)"""
+    The modules are the ones of the profile this version ships and the NROs the game registers (collect_nros; nro.tsv beside them lists those). Reused when the modules, patch_nso.py (with the
+    modules it imports: nso.py, nso_code.py, nso_asm.py, nso_match.py, the ue_*.py readers..., and the patch files of their builds and of the selected game), its switches, DM_GAME, the repository
+    profile's build rows and capstone are as at the last successful rewrite (Monster Hunter Rise's main alone takes 5.5 min). DM_REWRITE_J: patch_nso.py's workers per module (default: a share of the cores)"""
     import capstone
-    mods = g.words('modules')
+    try: workers = int(env['DM_REWRITE_J']) if env.get('DM_REWRITE_J') else None
+    except ValueError: raise BuildError('DM_REWRITE_J must be a positive integer') from None
+    if workers is not None and workers < 1: raise BuildError('DM_REWRITE_J must be a positive integer')
+    mods = g.modules_in(exe_dir)   # a version may lack a module of the profile another version has (game.py build_modules; Mario Kart World 1.0.0 has no subsdk1)
     PROG.stage('rewrite', step='checking the inputs')
     nro_dir = out.with_name('nro_' + out.name.removeprefix('patched_'))
-    nros = collect_nros(py, repo, exe_dir.parent / 'RomFS', nro_dir, env, logs)
+    nros = collect_nros(py, repo, romfs_source(exe_dir.parent), nro_dir, env, logs)
     manifest = nro_dir / 'nro.tsv'
     src = {m: exe_dir / m for m in mods} | nros
     names = list(src)
     kf = out.with_name(out.name + '.key')
     extra = [Path(p) for p in env.get('DM_PATCHES_EXTRA', '').split(os.pathsep) if p]   # cuts from outside the repository (patch_nso.py DM_PATCHES_EXTRA: an Android port's 60 fps code bytes)
-    key = fingerprint(('files', [repo / 'dm/tools' / f for f in ('patch_nso.py', 'nso_code.py', 'nso_asm.py')] + patch_files(repo, exe_dir, mods) + extra + list(src.values()) + ([manifest] if manifest.is_file() else [])), names, capstone.__version__,
-                      {k: env.get(k) for k in ('DM_PATCH_FRONT',)})
+    # the repository profile's build rows decide which builds the rewriter treats as the game's own (SDK-wide function patches skip those), and its snowdrop_pools the sizes of those cuts, so they are inputs too
+    try: own = [l for l in (repo / 'dm/games' / Path(env.get('DM_GAME') or '-').name / 'game.tsv').read_text(encoding='utf-8').splitlines() if l.startswith(('build\t', 'snowdrop_pools\t'))]
+    except OSError: own = []
+    tools = [repo / 'dm/tools' / f for f in ('patch_nso.py', 'nso.py', 'nso_code.py', 'nso_asm.py', 'nso_match.py', 'nso_syms.py', 'fps_target.py', 'snowdrop_pools.py', 'loader_census.py')]
+    key = fingerprint(('files', tools + sorted((repo / 'dm/tools').glob('ue_*.py')) + patch_files(repo, exe_dir, mods, env.get('DM_GAME')) + extra + list(src.values())
+                       + ([manifest] if manifest.is_file() else [])), names, capstone.__version__, {k: env.get(k) for k in ('DM_PATCH_FRONT', 'DM_GAME')}, own)
     if all((out / f'{m}.patched.bin').is_file() for m in names) and reused(kf, key) is not None:
         PROG.end(f'{", ".join(mods)}{f" and {len(nros)} NROs" if nros else ""}, reused (inputs unchanged)'); return
     tmp = out.with_name(out.name + '.partial'); rmtree(tmp); tmp.mkdir(parents=True); logs.mkdir(parents=True, exist_ok=True)
     if manifest.is_file(): shutil.copyfile(manifest, tmp / 'nro.tsv')   # refused-only manifests preserve the game's offline registration path too
     PROG.set(step=', '.join(mods) + (f' and {len(nros)} NROs' if nros else ''), done=0, total=len(names), unit='modules')
     procs, logf, todo, cores = {}, {}, list(names), max(2, os.cpu_count() or 4)
+    jobs = max(1, min(cores, 2 * cores // max(1, len(names))))   # patch_nso.py workers per module, so parallel rewrites don't oversubscribe
+    rewrite_env = dict(env, DM_REWRITE_J=str(workers if workers is not None else jobs))
     try:
         while todo or procs:
             while todo and len(procs) < cores:
                 m = todo.pop(0); logf[m] = open(logs / f'rewrite_{m}.log', 'w')
-                procs[m] = subprocess.Popen([str(py), str(repo / 'dm/tools/patch_nso.py'), str(src[m]), str(tmp), m], env=env, stdout=logf[m], stderr=subprocess.STDOUT)
+                procs[m] = subprocess.Popen([str(py), str(repo / 'dm/tools/patch_nso.py'), str(src[m]), str(tmp), m], env=rewrite_env, stdout=logf[m], stderr=subprocess.STDOUT)
             for m in [m for m in procs if procs[m].poll() is not None]:
                 p = procs.pop(m); logf[m].close(); PROG.set(done=len(names) - len(todo) - len(procs))
                 if p.returncode:
@@ -900,6 +976,31 @@ def rewrite(py, repo, exe_dir, out, env, logs, g):
         for f in logf.values(): f.close()
     rmtree(kf); swap_in(tmp, out); kf.write_text(f'{key}\n')
     PROG.end(', '.join(mods) + (f' and {len(nros)} NROs' if nros else ''))
+
+
+def report_fix_coverage(patched, mods, reg):
+    """What the modules of builds the profile does not register kept of their registered builds' cuts (upstream b1c74260): the rewriter's <module>.match.tsv (patch_nso.py) lists the cuts of
+    those builds and each function patch's result; a game patch not applied, or registered cuts with no function patch at all, is a red line (the game may stop where they were needed).
+    SDK-wide patches (sdk_patches.py) are listed as applied or not, without red: a module of a game without virtual address memory needs none"""
+    for m in mods:
+        try: rows = [l.split('\t') for l in (patched / f'{m}.match.tsv').read_text().splitlines() if l and not l.startswith('#')]
+        except OSError: continue
+        known = [r[1:] for r in rows if r[0] == 'registered' and len(r) == 4]
+        tried = [r[1:] for r in rows if r[0] == 'patch' and len(r) == 4]
+        sdk = [r[1:] for r in rows if r[0] == 'sdk' and len(r) == 4]
+        lost = '; '.join(f'{disp} ({bid[:8]}…) has {n} cuts' for bid, disp, n in known)
+        if sdk:
+            applied, absent = [n for n, offs, _ in sdk if offs != '-'], [n for n, offs, _ in sdk if offs == '-']
+            say(f'{m}: SDK-wide patches' + (f' applied: {", ".join(map(repr, applied))}' if applied else '') + ('; ' if applied and absent else '')
+                + (f' with no reviewed implementation in this build, so not applied: {", ".join(map(repr, absent))}' if absent else ''))
+        if not tried:
+            if known and not any(offs != '-' for _, offs, _ in sdk):
+                say(f'[RED] {m}: no function patch carries the registered builds\' fixes to this build ({lost}), and the game may stop where they were needed; see {reg.dir / "README.md"}')
+            continue
+        missing = [(name, why) for name, offs, why in tried if offs == '-']
+        if missing: say(f'[RED] {m}: function patches not applied, and the game may stop where they were needed: ' + '; '.join(f'{name!r} ({why})' for name, why in missing)
+                        + (f' (registered: {lost})' if lost else ''))
+        if len(missing) < len(tried): say(f'{m}: function patches applied: ' + ', '.join(repr(name) for name, offs, _ in tried if offs != '-'))
 
 
 GLSLC_SECS = 30   # the longest capture run: Three Houses compiles its 9 shaders within 1.2 s of boot, and the run stops as soon as every file the profile names is there
@@ -1259,17 +1360,27 @@ def split_shaders(py, repo, roms, mains, pkg, env, logs, g, provisional=False, o
     key = None if provisional or ALLOW_DAMAGED else fingerprint(('files', tool_files(repo)), ('files', profile_files(g)),
         *[x for r, m in zip(roms, mains) for x in (('files', [m]), ('tree', r), ('files', sorted((r.parent / 'glslc_capture').glob('*.glslc'))),
                                                    ('files', sorted((r.parent / 'ue_shaders').glob('*.ushaderbytecode'))))], *([('tree', aoc)] if aoc else []))
-    if key and pkg.is_dir() and (note := reused(kf, key)) is not None:
+    have_pairs = g.table('pso_pairs.tsv').is_file() or pkg.with_name('pso_pairs.tsv').is_file()   # a split before the 4th table splits again once
+    if key and pkg.is_dir() and have_pairs and (note := reused(kf, key)) is not None:
         PROG.end(f'{note}, reused (inputs unchanged)'); return package_key(pkg)
     if oodle:   # the packs are decoded by the game's own Oodle in the Mac host (dm/host/hle_oodle.c)
         PROG.set(step="setting up the game's Oodle decoder"); env = dict(env, **oodle())
     if aoc: env = dict(env, DM_SPLIT_AOC=str(aoc))
     PROG.set(step='splitting')
     tmp = pkg.with_name(pkg.name + '.partial'); rmtree(tmp); (tmp / 'tables').mkdir(parents=True)
-    run([py, repo / 'dm/gfx/tools/shader_split.py', ','.join(map(str, roms)), ','.join(map(str, mains)), tmp / 'pkg'] + [tmp / 'tables' / n for n in names], logs / 'shader_split.log', env=env)
-    m = re.search(r'shaders: (\d+) \(', (logs / 'shader_split.log').read_text(errors='replace'))
+    run([py, repo / 'dm/gfx/tools/shader_split.py', ','.join(map(str, roms)), ','.join(map(str, mains)), tmp / 'pkg'] + [tmp / 'tables' / n for n in names + ('pso_pairs.tsv',)],
+        logs / 'shader_split.log', env=env)
+    text = (logs / 'shader_split.log').read_text(errors='replace')
+    m = re.search(r'shaders: (\d+) \(', text)
+    bad = re.search(r'^\[RED\] (\d+) file\(s\) could not be read.*$', text, re.M)   # the split leaves out a file no reader reads (its own red line per file in the log) and goes on (upstream)
+    if bad and not provisional:   # the profile's tables were split from every file: one that does not read now is a reader change
+        raise BuildError(f'{bad.group(0).removeprefix("[RED] ")}; the profile\'s tables hold every file\'s shaders (each file in {logs / "shader_split.log"})')
+    if bad: say(f'{bad.group(0)}; the app goes without them (each file in {logs / "shader_split.log"})')
     if m and m.group(1) == '0':   # dmsh_build.py would make no library, and the iOS shader step stop with no word of why
         raise BuildError('the shader split found no shaders in main or the RomFS: the game keeps them in a form shader_split.py does not read; locate them (docs/agents) and add a reader')
+    # pso_pairs.tsv (upstream's 4th table: supplemental BAHS variations and legacy Unity pass-input covers): checked like the others where the profile has one, else kept beside the package
+    if provisional or g.table('pso_pairs.tsv').is_file(): names += ('pso_pairs.tsv',)
+    else: shutil.copyfile(tmp / 'tables' / 'pso_pairs.tsv', pkg.with_name('pso_pairs.tsv'))
     if provisional:   # a provisional profile takes the tables as they come
         for n in names: shutil.copyfile(tmp / 'tables' / n, g.table(n))
     else:

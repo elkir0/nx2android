@@ -8,13 +8,14 @@
 #include "dm.h"
 #include "nvn_obj.h"
 #include "nvn_mtl.h"
+#include "nvn_timestamp.h"
 #include <pthread.h>
 #include <stdatomic.h>
 #include <string.h>
 #include <time.h>
 
 uint64_t guest_ns(void);
-static uint64_t gpu_ticks(void) { uint64_t g = guest_ns(); if (!g) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); g = (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; } return g * 12 / 625; }
+static uint64_t gpu_ticks(void) { uint64_t g = guest_ns(); if (!g) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); g = (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; } return nvn_timestamp_from_ns(g); }   // the GPU's 614.4 MHz (nvn_timestamp.h)
 
 // ---------------- memory pools: GPU address = CPU address ----------------
 typedef struct { uint64_t lo, hi; } pool_ent;
@@ -39,6 +40,9 @@ int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off) {
     return ok;
 }
 void mtl_alias_drop_pool(const void *pool) { (void)pool; }
+// a virtual pool's range (Android: no CPU alias of it, hle_nvn.c nvn_virt_xlat): read and written at the physical memory behind it; NULL: left alone
+int nvn_virt_xlat(uint64_t a, uint64_t n, uint64_t *out);
+static void *nptr(uint64_t a, uint64_t n) { uint64_t t; int r = nvn_virt_xlat(a, n, &t); return r == 1 ? (void *)(uintptr_t)t : r ? NULL : (void *)(uintptr_t)a; }
 
 // ---------------- submissions ----------------
 typedef struct { int kind; volatile uint32_t *val; uint32_t mode, v; uint64_t addr; uint32_t type; } post_op;   // kind 1 event, 2 counter
@@ -50,8 +54,8 @@ void mtl_init(void) {}
 void mtl_sub_begin(void) { g_npost = 0; }
 void mtl_sub_index(const uint64_t *h, int n) { (void)h; (void)n; }
 void mtl_exec_rest(const uint64_t *h, int n) { (void)h; (void)n; }
-void mtl_sub_copy(uint64_t src, uint64_t dst, uint64_t n) { if (n) memmove((void *)(uintptr_t)dst, (const void *)(uintptr_t)src, n); }
-void mtl_sub_fill(uint64_t dst, uint64_t n, uint32_t value) { uint8_t *d = (uint8_t *)(uintptr_t)dst; for (uint64_t i = 0; i + 4 <= n; i += 4) memcpy(d + i, &value, 4); }
+void mtl_sub_copy(uint64_t src, uint64_t dst, uint64_t n) { void *d = n ? nptr(dst, n) : NULL, *s = n ? nptr(src, n) : NULL; if (d && s) memmove(d, s, n); }
+void mtl_sub_fill(uint64_t dst, uint64_t n, uint32_t value) { uint8_t *d = n ? nptr(dst, n) : NULL; for (uint64_t i = 0; d && i + 4 <= n; i += 4) memcpy(d + i, &value, 4); }
 void mtl_sub_event(volatile uint32_t *val, uint32_t mode, uint32_t v) { post((post_op){1, val, mode, v, 0, 0}); }
 void mtl_sub_counter(uint64_t addr, uint32_t type) { post((post_op){2, NULL, 0, 0, addr, type}); }
 
@@ -68,7 +72,7 @@ void mtl_exec(const uint8_t *p) {
         case OP_FENCE_SYNC: { sync_t *s; memcpy(&s, a, 8); s->fence = g_fence + 1; s->fenced = 1; break; }
         case OP_CLEAR_BUF: { const p_clear_buf *cb = (const p_clear_buf *)a; mtl_sub_fill(cb->addr, cb->size, cb->value); break; }
         case OP_COPY_B2B: { uint64_t s_, d, n; memcpy(&s_, a, 8); memcpy(&d, a + 8, 8); memcpy(&n, a + 16, 8); mtl_sub_copy(s_, d, n); break; }
-        case OP_UPDATE_UB: { uint64_t d, n; memcpy(&d, a, 8); memcpy(&n, a + 8, 8); memcpy((void *)(uintptr_t)d, a + 16, n); break; }
+        case OP_UPDATE_UB: { uint64_t d, n; memcpy(&d, a, 8); memcpy(&n, a + 8, 8); void *at = n ? nptr(d, n) : NULL; if (at) memcpy(at, a + 16, n); break; }
         default: break;   // drawing, binding, texture copies and clears: no visible effect without a GPU
         }
         p += h.size;
@@ -78,8 +82,8 @@ uint64_t mtl_sub_commit(void) {
     uint64_t now = gpu_ticks();
     for (int i = 0; i < g_npost; i++) {
         post_op *o = &g_post[i];
-        if (o->kind == 1) { if (o->mode == 1) *o->val += o->v; else *o->val = o->v; }
-        else { uint64_t rec[2] = {o->type == 0 || o->type == 0x10 ? now : o->type == NVN_COUNTER_TYPE_SAMPLES_PASSED ? (1u << 20) : 0, now}; memcpy((void *)(uintptr_t)o->addr, rec, sizeof rec); }
+        if (o->kind == 1) { volatile uint32_t *val = nptr((uint64_t)(uintptr_t)o->val, 4); if (val) { if (o->mode == 1) *val += o->v; else *val = o->v; } }
+        else { uint64_t rec[2] = {o->type == 0 || o->type == 0x10 ? now : o->type == NVN_COUNTER_TYPE_SAMPLES_PASSED ? (1u << 20) : 0, now}; void *at = nptr(o->addr, sizeof rec); if (at) memcpy(at, rec, sizeof rec); }
     }
     g_npost = 0;
     return ++g_fence;
@@ -117,6 +121,30 @@ void mtl_reg_tex(int tid, const tex_t *t, const view_t *v) { (void)tid; (void)t;
 void mtl_reg_samp(int sid, const samp_par *sp) { (void)sid; (void)sp; }
 void mtl_set_tex_pool_n(int n) { (void)n; }
 void mtl_prog_release(prog_t *p) { (void)p; }
+// The Switch 2 port's entry points (nvn_mtl.h, nvn_obj.h): nothing is drawn here, so none has an effect beyond what the CPU can see
+void mtl_prepare(void) {}
+int mtl_wait_acq(uint64_t fence, uint64_t timeout_ns) { return mtl_wait(fence, timeout_ns); }
+void mtl_queue_activate(uint64_t serial) { (void)serial; }
+void mtl_queue_forget(uint64_t serial) { (void)serial; }
+void mtl_set_queue_origin_lower_left(int on) { (void)on; }
+void mtl_pool_gpu_written(const void *pool) { pool_t *p = (pool_t *)pool; if (p) atomic_store(&p->gpu_written, 1); }
+void mtl_sp_phys_gone(const void *mem, uint64_t size) { (void)mem; (void)size; }
+void mtl_reg_tex_gone(int id) { (void)id; }
+void mtl_reg_image(int id, const tex_t *t, const view_t *v) { (void)id; (void)t; (void)v; }
+void mtl_prog_prefetch(const prog_t *p) { (void)p; }
+void mtl_prog_forget(const prog_t *p) { (void)p; }
+unsigned mtl_cpu_tex_count(void) { return 0; }
+uint64_t mtl_pkg_edge_skips(void) { return 0; }
+int mtl_tex_gpu_owned(uint64_t serial) { (void)serial; return 0; }
+uint64_t mtl_samp_seq(void) { return 0; }
+void mtl_present_flush(void) {}
+void mtl_present_test_stall(uint64_t ns) { (void)ns; }
+int mtl_warm_wait(int timeout_ms) { (void)timeout_ms; return 0; }
+void mtl_pso_line(char *o, size_t n) { if (n) snprintf(o, n, "none (the null device)"); }
+void *mtl_device(void) { return NULL; }
+void *mtl_device_classic(void) { return NULL; }
+uint64_t mtl_ext_tex(void *tex) { (void)tex; return 0; }
+uint64_t mtl_present_ext(uint64_t serial, double period, void *ev, uint64_t ev_val, const int crop[4]) { (void)serial; (void)period; (void)ev; (void)ev_val; (void)crop; return 0; }
 void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, uint8_t *dst, size_t row, size_t img) {
     (void)t; (void)level; (void)layer0; (void)img;
     if (r && dst) for (int z = 0; z < (r->depth ? r->depth : 1); z++) for (int y = 0; y < r->height; y++) memset(dst + (size_t)z * img + (size_t)y * row, 0, row);

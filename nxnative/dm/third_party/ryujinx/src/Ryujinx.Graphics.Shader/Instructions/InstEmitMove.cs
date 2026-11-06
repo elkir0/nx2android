@@ -67,13 +67,35 @@ namespace Ryujinx.Graphics.Shader.Instructions
             EmitR2p(context, value, mask, op.ByteSel, op.Ccpr);
         }
 
+        public static void Pixld(EmitterContext context)
+        {
+            InstPixld op = context.GetOp<InstPixld>();
+
+            // nxnative: PIXLD.MYINDEX is the index of the sample the fragment runs for. GLSLC reads it (RZ, offset 0) for gl_SampleID and to index the driver's sample position
+            // table (c0 + 0x620, 438 pixel shaders of Metroid Prime Remastered's MaterialArchive.arc); a fragment function that reads it runs once per sample, in Metal too
+            // ([[sample_id]]). Upstream wrote nothing, so the register read as 0: sample 0. The other modes (coverage, sample offsets) and an address operand are not implemented.
+            if (op.PixMode == PixMode.MyIndex && op.SrcA == RegisterConsts.RegisterZeroIndex && op.Imm8 == 0 &&
+                op.DestPred == RegisterConsts.PredicateTrueIndex && context.TranslatorContext.Definitions.Stage == ShaderStage.Fragment)
+            {
+                context.Copy(GetDest(op.Dest), context.Load(StorageKind.Input, IoVariable.SampleId));
+                return;
+            }
+
+            context.TranslatorContext.GpuAccessor.Log($"Shader instruction Pixld ({op.PixMode}) is not implemented.");
+        }
+
         public static void S2r(EmitterContext context)
         {
             InstS2r op = context.GetOp<InstS2r>();
 
+            context.Copy(GetDest(op.Dest), EmitSReg(context, op.SReg));
+        }
+
+        private static Operand EmitSReg(EmitterContext context, SReg sreg)
+        {
             Operand src;
 
-            switch (op.SReg)
+            switch (sreg)
             {
                 case SReg.LaneId:
                     src = EmitLoadSubgroupLaneId(context);
@@ -167,7 +189,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
                     break;
             }
 
-            context.Copy(GetDest(op.Dest), src);
+            return src;
         }
 
         private static Operand EmitLoadSubgroupLaneId(EmitterContext context)
@@ -188,32 +210,12 @@ namespace Ryujinx.Graphics.Shader.Instructions
             {
                 return context.Load(StorageKind.Input, ioVariable, null, Const(0));
             }
-            else if (subgroupSize == 64)
-            {
-                Operand laneId = context.Load(StorageKind.Input, IoVariable.SubgroupLaneId);
-                Operand low = context.Load(StorageKind.Input, ioVariable, null, Const(0));
-                Operand high = context.Load(StorageKind.Input, ioVariable, null, Const(1));
 
-                return context.ConditionalSelect(context.BitwiseAnd(laneId, Const(32)), high, low);
-            }
-            else
-            {
-                Operand laneId = context.Load(StorageKind.Input, IoVariable.SubgroupLaneId);
-                Operand element = context.ShiftRightU32(laneId, Const(5));
+            // nx2android: the mask's word of this lane's 32-lane warp (lane id >> 5) picked at run time, for any subgroup up to 128 lanes, as InstEmitWarp.EmitBallot
+            // (upstream's 128 form loaded the four words and chose by three compares and selects)
+            Operand word = context.ShiftRightU32(context.Load(StorageKind.Input, IoVariable.SubgroupLaneId), Const(5));
 
-                Operand res = context.Load(StorageKind.Input, ioVariable, null, Const(0));
-                res = context.ConditionalSelect(
-                    context.ICompareEqual(element, Const(1)),
-                    context.Load(StorageKind.Input, ioVariable, null, Const(1)), res);
-                res = context.ConditionalSelect(
-                    context.ICompareEqual(element, Const(2)),
-                    context.Load(StorageKind.Input, ioVariable, null, Const(2)), res);
-                res = context.ConditionalSelect(
-                    context.ICompareEqual(element, Const(3)),
-                    context.Load(StorageKind.Input, ioVariable, null, Const(3)), res);
-
-                return res;
-            }
+            return context.Load(StorageKind.Input, ioVariable, null, word);
         }
 
         public static void SelR(EmitterContext context)

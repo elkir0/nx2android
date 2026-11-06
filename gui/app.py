@@ -55,7 +55,7 @@ class PortTab(QWidget):
         self.porter = Porter(self); self.porter.event.connect(self.on_event); self.porter.finished.connect(self.on_finished)
         v = QVBoxLayout(self)
 
-        self.folder = QLineEdit(); self.folder.setPlaceholderText('the folder with the game\'s NSP / XCI / NSZ / XCZ files (base game, update, DLC)')
+        self.folder = QLineEdit(); self.folder.setPlaceholderText('the folder with the game\'s NSP / XCI / NSZ / XCZ files (base game, update, DLC), its NUP, or its dump folders')
         self.folder.editingFinished.connect(self.inspect)
         g = QGroupBox('Game'); gl = QVBoxLayout(g)
         gl.addWidget(path_row(self.folder, self.pick_folder))
@@ -149,14 +149,15 @@ class PortTab(QWidget):
     def on_inspect(self, info, code):
         err = info
         self.info = info = None if info and info.get('error') else info
-        if not info: self.card.setText('<span style="color:#c62828">' + ((err or {}).get('error') or 'No game found in this folder (an NSP, XCI, NSZ or XCZ with a title ID).') + '</span>'); return
+        if not info: self.card.setText('<span style="color:#c62828">' + ((err or {}).get('error') or 'No game found in this folder (an NSP, XCI, NSZ or XCZ with a title ID, a NUP, or a dump folder).') + '</span>'); return
         a = info.get('android') or {}
         st = a.get('status', 'ios only' if info.get('profile') else 'not supported')
         col = STATUS_COLOUR.get(st, '#c62828')
         rows = [(f'<b>{info["name"]}</b> &nbsp; <span style="color:#757575">{info["title_id"]}</span>' if info.get('name') else f'<b>{info["title_id"]}</b>') + ' &nbsp; '
                 f'<span style="background:{col};color:white;padding:1px 6px">&nbsp;{st}&nbsp;</span>']
-        files = [f'base game' ] + [f'update {u["version"]}' for u in info['updates']] + ([f'{len(info["dlc"])} DLC'] if info['dlc'] else [])
-        rows.append('In the folder: ' + ', '.join(files) + (f' — packs <b>{info["pack"]}</b>' if info.get('pack') else ''))
+        files = (['base game'] if info.get('base') else []) + [f'update {u["version"]}' for u in info['updates']] + ([f'{len(info["dlc"])} DLC'] if info['dlc'] else [])
+        rows.append('In the folder' + {'nup': ' (a NUP)', 'dump': ' (a dump folder)'}.get(info.get('kind'), '') + ': ' + ', '.join(files) + (f' — packs <b>{info["pack"]}</b>' if info.get('pack') else ''))
+        if info.get('note'): rows.append(f'<span style="color:#757575">{info["note"]}</span>')
         if info.get('compressed'): rows.append(f'<span style="color:#757575">NSZ / XCZ ({len(info["compressed"])}): decompressed during the port into a temporary folder, deleted once extracted</span>')
         if a.get('tested'): rows.append(f'Tested: {a["tested"]}')
         if info.get('reason'): rows.append(f'<span style="color:{"#ef6c00" if info["supported"] else "#c62828"}">{info["reason"]}</span>')
@@ -183,7 +184,7 @@ class PortTab(QWidget):
     # ---- the port ----
     def start(self):
         cfg = config.load()
-        if not cfg.get('keys'):
+        if not cfg.get('keys') and (self.info or {}).get('needs_keys', True):   # a NUP and a dump folder are not encrypted
             QMessageBox.warning(self, 'prod.keys', 'Set the path of your prod.keys on the Setup tab first.'); self.win.tabs.setCurrentIndex(1); return
         args = ['port', self.folder.text().strip(), '--progress', 'json']
         if self.app_name.text().strip(): args += ['--app-name', self.app_name.text().strip()]

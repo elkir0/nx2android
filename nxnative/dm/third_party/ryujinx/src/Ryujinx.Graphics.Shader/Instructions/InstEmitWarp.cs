@@ -109,36 +109,13 @@ namespace Ryujinx.Graphics.Shader.Instructions
             {
                 return context.Ballot(pred, 0);
             }
-            else if (subgroupSize == 64)
-            {
-                // TODO: Add support for vector destination and do that with a single operation.
 
-                Operand laneId = context.Load(StorageKind.Input, IoVariable.SubgroupLaneId);
-                Operand low = context.Ballot(pred, 0);
-                Operand high = context.Ballot(pred, 1);
+            // nx2android: one ballot, and its word of this lane's 32-lane warp (lane id >> 5) picked at run time, for any subgroup up to 128 lanes. Upstream's 128 form
+            // took a ballot per word and chose by three compares and selects (VoteAll / VoteAllEqual twice that): 4 OpGroupNonUniformBallot where 1 does, 8 where 2 do.
+            // The Android chain translates for 128 (shader_vk.py SUBGROUP): Mario Kart World 1.8.0 has 1,740 ballots and 17,420 instructions fewer in 187 modules
+            Operand word = context.ShiftRightU32(context.Load(StorageKind.Input, IoVariable.SubgroupLaneId), Const(5));
 
-                return context.ConditionalSelect(context.BitwiseAnd(laneId, Const(32)), high, low);
-            }
-            else
-            {
-                // TODO: Add support for vector destination and do that with a single operation.
-
-                Operand laneId = context.Load(StorageKind.Input, IoVariable.SubgroupLaneId);
-                Operand element = context.ShiftRightU32(laneId, Const(5));
-
-                Operand res = context.Ballot(pred, 0);
-                res = context.ConditionalSelect(
-                    context.ICompareEqual(element, Const(1)),
-                    context.Ballot(pred, 1), res);
-                res = context.ConditionalSelect(
-                    context.ICompareEqual(element, Const(2)),
-                    context.Ballot(pred, 2), res);
-                res = context.ConditionalSelect(
-                    context.ICompareEqual(element, Const(3)),
-                    context.Ballot(pred, 3), res);
-
-                return res;
-            }
+            return context.BallotWord(pred, word);
         }
     }
 }

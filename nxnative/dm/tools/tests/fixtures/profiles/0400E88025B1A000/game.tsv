@@ -1,0 +1,6 @@
+# Test fixture (dm/tools/tests): the rows of upstream's profile 0400E88025B1A000 that shader_split.py reads; nx2android has no profile of this game
+title_id	0400E88025B1A000
+program_id	0400E88025B1A000
+name	Star Fox
+shader_groups	/data.zip=shader
+shader_note	Star Fox shaders

@@ -4,7 +4,12 @@ struct dm_flags g_flag;
 uint64_t g_t0_ns;
 void crash_thread_init(void) {}
 void guest_thread_init(void) {}
+void guest_thread_set_id(uint64_t id) { (void)id; }
+void guest_gate_stack(int own_stack) { (void)own_stack; }
+// The notification scheduler test supplies a C entry for real thread SVCs.
+#ifndef DM_TEST_THREAD_ENTER
 void dm_thread_enter(uint64_t entry, uint64_t arg, uint64_t sp) { (void)entry; (void)arg; (void)sp; abort(); }
+#endif
 void *guest_sym(const char *name) { (void)name; return NULL; }
 module_t *module_of(const void *p) { (void)p; return NULL; }
 #include <mach/mach_time.h>
@@ -13,3 +18,8 @@ uint64_t guest_ns(void) { return now_ns(); }
 int dm_detclock_enabled(void) { return 0; }
 __thread _Atomic int dm_host_work;   // referenced by hle_thread.c; in the host it is defined in hle_nvn.c
 pthread_key_t g_key18;   // read by hle_thread.c's SVC entry and pause signal; in the host it is defined in loader.c (never created here: those paths do not run)
+// The thread dump's address names and the timed waits' backtraces (DM_SLEEP_BT) of the Android fork's hle_thread.c: crash.c in the host
+int crash_addr_str(char *b, size_t n, uint64_t a) { return snprintf(b, n, "%#llx", (unsigned long long)a); }
+uint64_t crash_code_addr(uint64_t a) { return a; }
+void crash_thread_name(unsigned t, char *b, size_t n) { (void)t; if (n) b[0] = 0; }
+void dm_backtrace(uint64_t fp) { (void)fp; }

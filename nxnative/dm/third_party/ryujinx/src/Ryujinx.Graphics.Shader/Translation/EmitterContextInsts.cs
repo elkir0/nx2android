@@ -121,9 +121,25 @@ namespace Ryujinx.Graphics.Shader.Translation
             return dest;
         }
 
+        // nx2android: word "word" of the subgroup's ballot of a, a value known at run time (InstEmitWarp.EmitBallot: the word of this lane's 32-lane warp)
+        public static Operand BallotWord(this EmitterContext context, Operand a, Operand word)
+        {
+            Operand dest = Local();
+
+            context.Add(new Operation(Instruction.Ballot, 0, dest, a, word));
+
+            return dest;
+        }
+
         public static Operand Barrier(this EmitterContext context)
         {
             return context.Add(Instruction.Barrier);
+        }
+
+        // nxnative: a barrier for the lanes of one subgroup (SPIR-V OpControlBarrier with subgroup scope; Metal simdgroup_barrier)
+        public static Operand SubgroupBarrier(this EmitterContext context)
+        {
+            return context.Add(Instruction.SubgroupBarrier);
         }
 
         public static Operand BitCount(this EmitterContext context, Operand a)

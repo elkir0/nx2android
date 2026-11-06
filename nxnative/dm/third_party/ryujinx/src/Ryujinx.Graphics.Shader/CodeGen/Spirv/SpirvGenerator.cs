@@ -45,7 +45,18 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
 
             context.AddCapability(Capability.Shader);
 
-            context.SetMemoryModel(AddressingModel.Logical, MemoryModel.GLSL450);
+            // nxnative: raw global memory goes through physical storage buffer pointers (ShaderProperties.UsesPhysicalPointers), which take 64-bit physical addressing
+            if (context.Properties.UsesPhysicalPointers)
+            {
+                context.AddCapability(Capability.PhysicalStorageBufferAddresses);
+                context.AddCapability(Capability.Int64);
+                context.AddExtension("SPV_KHR_physical_storage_buffer");
+                context.SetMemoryModel(AddressingModel.PhysicalStorageBuffer64, MemoryModel.GLSL450);
+            }
+            else
+            {
+                context.SetMemoryModel(AddressingModel.Logical, MemoryModel.GLSL450);
+            }
 
             context.AddCapability(Capability.GroupNonUniformBallot);
             context.AddCapability(Capability.GroupNonUniformShuffle);
@@ -71,6 +82,12 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
                     context.Info.IoDefinitions.Contains(new IoDefinition(StorageKind.Input, IoVariable.PrimitiveId)))
                 {
                     context.AddCapability(Capability.Geometry);
+                }
+
+                // nxnative: the sample index (PIXLD.MYINDEX) is a SampleRateShading input
+                if (context.Info.IoDefinitions.Contains(new IoDefinition(StorageKind.Input, IoVariable.SampleId)))
+                {
+                    context.AddCapability(Capability.SampleRateShading);
                 }
 
                 if (context.HostCapabilities.SupportsFragmentShaderInterlock)
@@ -120,6 +137,18 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
                 info.IoDefinitions.Add(new IoDefinition(StorageKind.Input, IoVariable.SubgroupLaneId));
             }
 
+            // nx2android: the workgroup's id, for the slice of shared memory in a buffer (SharedMemorySpill)
+            if (SharedMemorySpill.IsOn(context))
+            {
+                info.IoDefinitions.Add(new IoDefinition(StorageKind.Input, IoVariable.CtaId));
+            }
+
+            // nx2android: a task or mesh shader around the compute body (MeshStage): SPIR-V 1.4, the inputs its entry point reads
+            if (MeshStage.IsOn(context))
+            {
+                MeshStage.Begin(context, info);
+            }
+
             Declarations.DeclareAll(context, info);
 
             for (int funcIndex = 0; funcIndex < info.Functions.Count; funcIndex++)
@@ -139,12 +168,24 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
                 SpvInstruction funcType = context.TypeFunction(retType, false, funcArgs);
                 SpvInstruction spvFunc = context.Function(retType, FunctionControlMask.MaskNone, funcType);
 
+                // nxnative: helpers whose body the shader build replaces in the Metal source keep their name (dmsh_hmma16816_f16)
+                if (function.Name.StartsWith("dmsh_"))
+                {
+                    context.Name(spvFunc, function.Name);
+                }
+
                 context.DeclareFunction(funcIndex, function, spvFunc);
             }
 
             for (int funcIndex = 0; funcIndex < info.Functions.Count; funcIndex++)
             {
                 Generate(context, info, funcIndex);
+            }
+
+            // nx2android: the main function is the body, called by the task or mesh shader's entry point
+            if (MeshStage.IsOn(context))
+            {
+                MeshStage.Generate(context, context.GetFunction(0).Item2);
             }
 
             byte[] result = context.Generate();
@@ -170,7 +211,20 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
 
             context.EnterBlock(function.MainBlock);
 
+            // nx2android: the HMMA helper's body in packed half arithmetic (TensorF16), in place of its own
+            if (TensorF16.TryGenerate(context, function))
+            {
+                context.FunctionEnd();
+
+                return;
+            }
+
             Declarations.DeclareLocals(context, function);
+
+            if (funcIndex == 0)
+            {
+                SharedMemorySpill.EmitBase(context);
+            }
 
             Generate(context, function.MainBlock);
 
@@ -183,7 +237,7 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
 
             context.FunctionEnd();
 
-            if (funcIndex == 0)
+            if (funcIndex == 0 && !MeshStage.IsOn(context))
             {
                 context.AddEntryPoint(context.Definitions.Stage.Convert(), spvFunc, "main", context.GetMainInterface());
 

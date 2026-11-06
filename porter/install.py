@@ -8,6 +8,13 @@ from porter.adb import Adb, AdbError
 from porter.upstream import BuildError, PROG, say
 
 
+def push_need(data, have):
+    """The device space a push of the data pack takes: every file the device lacks at its size, written in full (a file it replaces goes only once the new one is whole: adb.push_file
+    renames its partial copy over it), plus the room of one piece, as push_file appends them"""
+    sizes = {p.relative_to(data).as_posix(): p.stat().st_size for p in Path(data).rglob('*') if p.is_file()}
+    return sum(s for rel, s in sizes.items() if have.get(rel) != s) + (64 << 20)
+
+
 def install(apk, data, adb_exe, serial=None, replace_signer=False):
     apk, data = Path(apk), Path(data)
     man = datapack.read_manifest(data)
@@ -28,7 +35,7 @@ def install(apk, data, adb_exe, serial=None, replace_signer=False):
         free = adb.free_bytes()
         files = datapack.files_folder(man['package'])
         have = adb.remote_sizes(files)
-        need = man['bytes'] - sum(have.values())
+        need = push_need(data, have)
         if free is not None and need > free: raise BuildError(f'the device has {free / 2**30:.1f} GB free; the game needs {need / 2**30:.1f} GB more')
         PROG.set(step=f'installing {apk.name}')
         adb.install(apk, man['package'], replace_signer=replace_signer)
@@ -36,7 +43,7 @@ def install(apk, data, adb_exe, serial=None, replace_signer=False):
         if adb.prepare_app_files(man['package']): say('started the app once so Android made its files folder (it stops at once without its data)')
         PROG.set(step='pushing the game data', done=0, total=man['bytes'], unit='B'); pushing = True
         have = adb.remote_sizes(files)   # again: an install with --replace-signer uninstalls first, and Android deletes the files folder with the app
-        adb.push_tree(data, files, keep=datapack.KEEP_ON_DEVICE, skip=(datapack.MANIFEST,), verify=lambda rel: rel.split('/', 1)[0] not in ('RomFS', 'aoc'),   # the game's own files change only with their version
+        adb.push_tree(data, files, keep=datapack.KEEP_ON_DEVICE, skip=(datapack.MANIFEST,), verify=lambda rel: rel.split('/', 1)[0] not in datapack.GAME_FILES,   # by size alone: they change only with their version
                       progress=lambda d, t, note: PROG.set(done=d, total=t, note=note), have=have)
         stale = [rel for rel in have if rel.split('/', 1)[0] in datapack.OWNED and not (data / rel).is_file()]   # the push only adds the pack's own files, which are never stale
         if stale:   # an older version's files, which the game would still find

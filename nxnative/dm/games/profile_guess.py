@@ -30,6 +30,12 @@ APP_POOL = 0xCD500000               # the application memory pool of a 4 GB Swit
 MiB = 1 << 20
 
 
+def glsl_sources(img):
+    """Complete embedded GLSL strings, rather than a compiler's language preamble. Snowdrop ships a #version header with typedefs but no entry point, even when it uses only archived shaders.
+    Three Houses embeds nine complete boot shaders. NRO callers that assemble shaders dynamically are detected separately by their glslcCompile import (build_sources)."""
+    return sum(bool(re.search(rb'\bvoid\s+main\s*\(', s)) for s in re.findall(rb'#version [^\0]*', img))
+
+
 def nso(path):
     """An NSO module: its three segments decompressed (the image without bss), build ID, segment sizes and bss size"""
     import lz4.block
@@ -177,7 +183,7 @@ def shader_sources(imports, glsl_src, glslc_mods, spirv, unreal_paks, trinity_pa
     GLSL source where gl_shaders.py looks, gl_src strings in main and gl_files files in the RomFS: it puts its shaders together at run time, LÖVE from its Lua), glslc_capture (main holds GLSL sources and calls glslcCompile in a module the game loads: it compiles some shaders at run time), ue_decode (Unreal paks keep the shaders Oodle-compressed
     in their shader code archives, which only the game's own Oodle decodes), oodle_packs (Trinity packs, or oodle_pkz PlatinumGames PKZ archives with Oodle Kraken entries:
     Oodle-compressed file by file, which the shader split decodes with the game's own decoder in the Mac host's tool mode), ue_legacy (legacy Unreal paks, version 4: the shaders are inline in the cooked packages, which the shader split reads through the game's own decoder the same way).
-    unreal_paks counts the version 11 paks, legacy_paks the older ones. Checked against every profile: Hades and Super Mario Galaxy Vulkan, Galaxy alone with no SPIR-V file, Three Houses alone compiling
+    unreal_paks counts the paks with shader code archives, legacy_paks those with inline shaders (uepak.inline_shaders, upstream's split of the old version test). Checked against every profile: Hades and Super Mario Galaxy Vulkan, Galaxy alone with no SPIR-V file, Three Houses alone compiling
     shaders (13 Sentinels holds 106 GLSL sources but does not import glslcCompile; Captain Toad: Treasure Tracker imports it with agl's GLSL sources, but no module defines it), Octopath Traveler 0
     alone with version 11 Unreal paks, DRAGON QUEST XI S alone with legacy ones, Pokémon Legends: Z-A alone with Trinity packs, Digimon Story Cyber Sleuth and Balatro alone with OpenGL (of the 23 games
     extracted; Hades and both Galaxies import 99 or 100 Vulkan functions, Balatro only vkGetInstanceProcAddr), Balatro alone composing its GLSL"""
@@ -227,7 +233,7 @@ def build_sources(exefs, romfs, modules):
                     h = f.read(0x20)
                     if h[:8] == b'GFLXPACK' and struct.unpack_from('<I', h, 0x10)[0]:
                         f.seek(struct.unpack_from('<Q', h, 0x18)[0]); e = f.read(4); oodle_gfpak += len(e) == 4 and struct.unpack_from('<H', e, 2)[0] == 3
-    return shader_sources(imports, glsl_src, glslc_mods, spirv, len(uepak.unreal_paks(str(romfs), legacy=False)), trinity, len(uepak.unreal_paks(str(romfs), legacy=True)), gl_names, gl_src, gl_files, oodle_pkz,
+    return shader_sources(imports, glsl_src, glslc_mods, spirv, len(uepak.unreal_paks(str(romfs), inline=False)), trinity, len(uepak.unreal_paks(str(romfs), inline=True)), gl_names, gl_src, gl_files, oodle_pkz,
                           oodle_gfpak)
 
 

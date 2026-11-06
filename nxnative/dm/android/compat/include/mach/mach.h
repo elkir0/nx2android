@@ -41,6 +41,10 @@ typedef uint32_t natural_t; typedef int32_t integer_t;
 #define VM_PROT_WRITE 2
 #define VM_PROT_EXECUTE 4
 
+// Darwin's page size global: the host's page size on Linux (4 KB, or 16 KB on a device with 16 KB pages)
+#include <unistd.h>
+#define vm_page_size ((vm_size_t)getpagesize())
+
 mach_port_t mach_task_self(void);
 mach_port_t mach_thread_self(void);
 kern_return_t mach_port_deallocate(task_t task, mach_port_t name);

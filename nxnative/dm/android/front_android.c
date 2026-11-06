@@ -1,7 +1,7 @@
 // Android port: the host front end (dm/host/front.h), in two forms.
 //   dmhost executable (adb shell): headless, the guest runs on the calling thread as on the Mac without DM_WINDOW; no window, no input, no text entry.
 //   libdmhost.so in the app (a NativeActivity, no Java): ANativeActivity_onCreate lays out the game's files in the app's external files folder
-//   (/sdcard/Android/data/<package>/files: mods/ = the rewritten modules, RomFS/, shaders.dmsv; env.txt = KEY=VALUE switches; log.txt = the log), keeps saves in
+//   (/sdcard/Android/data/<package>/files: mods/ = the rewritten modules, RomFS/ or one RomFS.img, shaders.dmsv; env.txt = KEY=VALUE switches; log.txt = the log), keeps saves in
 //   internal storage, and starts the host on a thread of its own. The window goes to the Vulkan backend's swapchain (dm_front_window); game controllers
 //   (KEYCODE_BUTTON_*, sticks, triggers, hat) feed player 1's pad; touches go to the game's touch screen; shaking the device shakes player 1's controller;
 //   leaving and coming back pauses as on iOS.
@@ -871,7 +871,10 @@ __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActi
     if (!freopen(p, "w", stderr)) __android_log_print(ANDROID_LOG_ERROR, "dmhost", "cannot write %s", p);
     setvbuf(stderr, NULL, _IOLBF, 0);
     setenv("DM_ROOT", g_root, 1);
-    snprintf(p, sizeof p, "%s/RomFS", g_root); setenv("DM_ROMFS", p, 0);
+    // The game's files: one RomFS image when the data pack holds RomFS.img (dm/tools/romfs_image.py; hle_fs.c reads its index at mount, then every file is a pread in that one
+    // file: Mario Kart World's 23.5 GB RomFS goes to the device that way), else the RomFS folder
+    { struct stat ist; snprintf(p, sizeof p, "%s/RomFS.img", g_root); if (stat(p, &ist) || !S_ISREG(ist.st_mode)) snprintf(p, sizeof p, "%s/RomFS", g_root); }
+    setenv("DM_ROMFS", p, 0);
     snprintf(p, sizeof p, "%s/save", act->internalDataPath); mkdir(p, 0700); setenv("DM_SAVE", p, 0);
     snprintf(p, sizeof p, "%s/temp", act->internalDataPath); mkdir(p, 0700); setenv("DM_TEMP", p, 0);
     snprintf(p, sizeof p, "%s/shaders.dmsv", g_root); setenv("DM_VK_SHADERS", p, 0);

@@ -10,6 +10,15 @@ typedef struct { uint8_t *keys; void **vals; uint32_t klen, cap, n; } nvn_hmap; 
 
 static inline uint64_t nvn_hm_hash(const void *k, uint32_t len) {
     const uint8_t *p = k; uint64_t h = 0x9e3779b97f4a7c15ull ^ len;
+    // A long key (the Android replay's 992-byte pipeline key, looked up about 800 times a frame in Mario Kart World's race) in four independent lanes of the same step, 32 bytes at a time:
+    // a quarter of the dependent multiplies, the step's latency being what the loop waits on (devtools/vkbench: the pipeline lookups' hash ~4x faster). The key is still compared whole
+    if (len >= 64) {
+        uint64_t a = h, b = h ^ 0x6a09e667f3bcc909ull, c = h ^ 0xbb67ae8584caa73bull, d = h ^ 0x3c6ef372fe94f82bull;
+        for (; len >= 32; p += 32, len -= 32) { uint64_t w[4]; memcpy(w, p, 32);
+            a = (a ^ w[0]) * 0xff51afd7ed558ccdull; a ^= a >> 32; b = (b ^ w[1]) * 0xff51afd7ed558ccdull; b ^= b >> 32;
+            c = (c ^ w[2]) * 0xff51afd7ed558ccdull; c ^= c >> 32; d = (d ^ w[3]) * 0xff51afd7ed558ccdull; d ^= d >> 32; }
+        h = a ^ (b << 16 | b >> 48) ^ (c << 32 | c >> 32) ^ (d << 48 | d >> 16);
+    }
     for (; len >= 8; p += 8, len -= 8) { uint64_t w; memcpy(&w, p, 8); h = (h ^ w) * 0xff51afd7ed558ccdull; h ^= h >> 32; }
     if (len) { uint64_t w = 0; memcpy(&w, p, len); h = (h ^ w) * 0xff51afd7ed558ccdull; }
     h ^= h >> 33; h *= 0xc4ceb9fe1a85ec53ull; h ^= h >> 33;
@@ -18,6 +27,14 @@ static inline uint64_t nvn_hm_hash(const void *k, uint32_t len) {
 static inline void nvn_hm_init(nvn_hmap *m, uint32_t klen) { memset(m, 0, sizeof *m); m->klen = klen; }
 static inline void *nvn_hm_get(const nvn_hmap *m, const void *k) {
     if (!m->n) return NULL;
+    if (m->klen == 8) {   // 8-byte keys (serials, pointers): one word compared per probe instead of a memcmp call with a run-time length (same probes, same answer; MacNativeGames 7431eb7)
+        uint64_t kk; memcpy(&kk, k, 8);
+        for (uint32_t i = (uint32_t)nvn_hm_hash(k, 8) & (m->cap - 1);; i = (i + 1) & (m->cap - 1)) {
+            if (!m->vals[i]) return NULL;
+            uint64_t ki; memcpy(&ki, m->keys + (size_t)i * 8, 8);
+            if (ki == kk) return m->vals[i];
+        }
+    }
     for (uint32_t i = (uint32_t)nvn_hm_hash(k, m->klen) & (m->cap - 1);; i = (i + 1) & (m->cap - 1)) {
         if (!m->vals[i]) return NULL;
         if (!memcmp(m->keys + (size_t)i * m->klen, k, m->klen)) return m->vals[i];

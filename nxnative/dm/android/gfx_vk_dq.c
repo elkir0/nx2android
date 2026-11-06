@@ -17,7 +17,8 @@
     X(vkCmdEndRendering) X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets) X(vkCmdBindVertexBuffers) X(vkCmdBindIndexBuffer) X(vkCmdSetViewport) X(vkCmdSetScissor) \
     X(vkCmdSetBlendConstants) X(vkCmdSetStencilReference) X(vkCmdSetStencilCompareMask) X(vkCmdSetStencilWriteMask) X(vkCmdSetDepthBias) X(vkCmdSetLineWidth) X(vkCmdDraw) \
     X(vkCmdPushConstants) X(vkCmdDrawIndexed) X(vkCmdDrawIndirect) X(vkCmdDrawIndexedIndirect) X(vkCmdDispatch) X(vkCmdDispatchIndirect) X(vkCmdResetQueryPool) \
-    X(vkCmdWriteTimestamp) X(vkCmdBindTransformFeedbackBuffersEXT) X(vkCmdBeginTransformFeedbackEXT) X(vkCmdEndTransformFeedbackEXT)
+    X(vkCmdWriteTimestamp) X(vkCmdBindTransformFeedbackBuffersEXT) X(vkCmdBeginTransformFeedbackEXT) X(vkCmdEndTransformFeedbackEXT) \
+    X(vkCmdDrawIndirectCount) X(vkCmdDrawIndexedIndirectCount) X(vkCmdDrawMeshTasksEXT) X(vkCmdDispatchBase)
 #define DQ_SYNC(X) X(vkBeginCommandBuffer) X(vkEndCommandBuffer) X(vkAllocateCommandBuffers) X(vkResetCommandPool) X(vkQueueSubmit) X(vkQueuePresentKHR) X(vkQueueWaitIdle) X(vkDeviceWaitIdle)
 #define DQ_REAL(f) static PFN_##f r_##f;
 DQ_CMDS(DQ_REAL) DQ_SYNC(DQ_REAL)
@@ -94,11 +95,13 @@ typedef struct { float c[4]; } a_blend;
 typedef struct { VkStencilFaceFlags f; uint32_t v; } a_stencil;
 typedef struct { float c, clamp, slope; } a_bias;
 typedef struct { uint32_t a, b, c, d; int32_t e; uint32_t f; } a_draw;
+typedef struct { uint32_t bx, by, bz, x, y, z; } a_dbase;
 typedef struct { VkPipelineLayout l; VkShaderStageFlags st; uint32_t off, size; } a_push;
 typedef struct { VkBuffer b; VkDeviceSize off; uint32_t n, stride; } a_indirect;
 typedef struct { VkQueryPool p; uint32_t first, n; } a_qreset;
 typedef struct { VkPipelineStageFlagBits st; VkQueryPool p; uint32_t q; } a_ts;
 typedef struct { uint32_t first, n; int has_sizes, has_bufs, has_offs; } a_xfb;
+typedef struct { VkBuffer b, cb; VkDeviceSize off, coff; uint32_t n, stride; } a_icount;   // vkCmdDraw(Indexed)IndirectCount (gfx_vk_exec.c multi_draw)
 
 static void run(const rec_hdr *h) {
     const uint8_t *p = (const uint8_t *)(h + 1); VkCommandBuffer cb = h->cb;
@@ -146,7 +149,11 @@ static void run(const rec_hdr *h) {
     case OP_vkCmdPushConstants: { const a_push *a = (const void *)p; r_vkCmdPushConstants(cb, a->l, a->st, a->off, a->size, p + sizeof *a); break; }
     case OP_vkCmdDrawIndirect: { const a_indirect *a = (const void *)p; r_vkCmdDrawIndirect(cb, a->b, a->off, a->n, a->stride); break; }
     case OP_vkCmdDrawIndexedIndirect: { const a_indirect *a = (const void *)p; r_vkCmdDrawIndexedIndirect(cb, a->b, a->off, a->n, a->stride); break; }
+    case OP_vkCmdDrawIndirectCount: { const a_icount *a = (const void *)p; r_vkCmdDrawIndirectCount(cb, a->b, a->off, a->cb, a->coff, a->n, a->stride); break; }
+    case OP_vkCmdDrawIndexedIndirectCount: { const a_icount *a = (const void *)p; r_vkCmdDrawIndexedIndirectCount(cb, a->b, a->off, a->cb, a->coff, a->n, a->stride); break; }
+    case OP_vkCmdDrawMeshTasksEXT: { const a_draw *a = (const void *)p; r_vkCmdDrawMeshTasksEXT(cb, a->a, a->b, a->c); break; }
     case OP_vkCmdDispatch: { const a_draw *a = (const void *)p; r_vkCmdDispatch(cb, a->a, a->b, a->c); break; }
+    case OP_vkCmdDispatchBase: { const a_dbase *a = (const void *)p; r_vkCmdDispatchBase(cb, a->bx, a->by, a->bz, a->x, a->y, a->z); break; }
     case OP_vkCmdDispatchIndirect: { const a_indirect *a = (const void *)p; r_vkCmdDispatchIndirect(cb, a->b, a->off); break; }
     case OP_vkCmdResetQueryPool: { const a_qreset *a = (const void *)p; r_vkCmdResetQueryPool(cb, a->p, a->first, a->n); break; }
     case OP_vkCmdWriteTimestamp: { const a_ts *a = (const void *)p; r_vkCmdWriteTimestamp(cb, a->st, a->p, a->q); break; }
@@ -271,8 +278,15 @@ static VKAPI_ATTR void VKAPI_CALL w_vkCmdPushConstants(VkCommandBuffer cb, VkPip
 #define W_INDIRECT(f) static VKAPI_ATTR void VKAPI_CALL w_##f(VkCommandBuffer cb, VkBuffer b, VkDeviceSize off, uint32_t n, uint32_t stride) { \
     { BEGIN(OP_##f, a_indirect, 0); *a = (a_indirect){b, off, n, stride}; (void)at_; rec_end(base_); return; } direct: DIRECT(f, cb, b, off, n, stride); }
 W_INDIRECT(vkCmdDrawIndirect) W_INDIRECT(vkCmdDrawIndexedIndirect)
+#define W_ICOUNT(f) static VKAPI_ATTR void VKAPI_CALL w_##f(VkCommandBuffer cb, VkBuffer b, VkDeviceSize off, VkBuffer cbuf, VkDeviceSize coff, uint32_t n, uint32_t stride) { \
+    { BEGIN(OP_##f, a_icount, 0); *a = (a_icount){b, cbuf, off, coff, n, stride}; (void)at_; rec_end(base_); return; } direct: DIRECT(f, cb, b, off, cbuf, coff, n, stride); }
+W_ICOUNT(vkCmdDrawIndirectCount) W_ICOUNT(vkCmdDrawIndexedIndirectCount)
+static VKAPI_ATTR void VKAPI_CALL w_vkCmdDrawMeshTasksEXT(VkCommandBuffer cb, uint32_t x, uint32_t y, uint32_t z) {
+    { BEGIN(OP_vkCmdDrawMeshTasksEXT, a_draw, 0); *a = (a_draw){x, y, z, 0, 0, 0}; (void)at_; rec_end(base_); return; } direct: DIRECT(vkCmdDrawMeshTasksEXT, cb, x, y, z); }
 static VKAPI_ATTR void VKAPI_CALL w_vkCmdDispatch(VkCommandBuffer cb, uint32_t x, uint32_t y, uint32_t z) {
     { BEGIN(OP_vkCmdDispatch, a_draw, 0); *a = (a_draw){x, y, z, 0, 0, 0}; (void)at_; rec_end(base_); return; } direct: DIRECT(vkCmdDispatch, cb, x, y, z); }
+static VKAPI_ATTR void VKAPI_CALL w_vkCmdDispatchBase(VkCommandBuffer cb, uint32_t bx, uint32_t by, uint32_t bz, uint32_t x, uint32_t y, uint32_t z) {
+    { BEGIN(OP_vkCmdDispatchBase, a_dbase, 0); *a = (a_dbase){bx, by, bz, x, y, z}; (void)at_; rec_end(base_); return; } direct: DIRECT(vkCmdDispatchBase, cb, bx, by, bz, x, y, z); }
 static VKAPI_ATTR void VKAPI_CALL w_vkCmdDispatchIndirect(VkCommandBuffer cb, VkBuffer b, VkDeviceSize off) {
     { BEGIN(OP_vkCmdDispatchIndirect, a_indirect, 0); *a = (a_indirect){b, off, 0, 0}; (void)at_; rec_end(base_); return; } direct: DIRECT(vkCmdDispatchIndirect, cb, b, off); }
 static VKAPI_ATTR void VKAPI_CALL w_vkCmdResetQueryPool(VkCommandBuffer cb, VkQueryPool p, uint32_t first, uint32_t n) {
@@ -298,6 +312,80 @@ static VKAPI_ATTR VkResult VKAPI_CALL w_vkQueuePresentKHR(VkQueue q, const VkPre
 static VKAPI_ATTR VkResult VKAPI_CALL w_vkQueueWaitIdle(VkQueue q) { vk_dq_drain(); return r_vkQueueWaitIdle(q); }
 static VKAPI_ATTR VkResult VKAPI_CALL w_vkDeviceWaitIdle(VkDevice d) { vk_dq_drain(); return r_vkDeviceWaitIdle(d); }
 
+// ---- full barriers back to back (DM_VK_BAR_MERGE, live, default 1; tests: tests/test_vk_gpuprof.py) ----
+// vk_img_barrier_all (gfx_vk_core.c) records the replay's barrier: every access of any stage before it before every access after it. One recorded right after another, with nothing but
+// binds, dynamic state and push constants between them, adds no dependency: the commands its first scope has beyond the first barrier's do no work, and its second scope lies inside the
+// first's. The replay makes such runs around dispatches (the barrier after one, NVN's Barrier, the barrier before the next) and before a pass that follows a dispatch (begin_pass), 158
+// dispatches a frame in Mario Kart World's races (run 13): the later ones are left out (g_bar_merged). Whether only state came between is known by a wrapper of every vkCmd* entry point
+// that records work (every one the backend calls is in DQ_CMDS), which takes the mark off; vkBeginCommandBuffer takes it off too (begun again, a command buffer starts empty, and its first
+// barrier orders it after the work before it). Installed over the two-stage replay's wrappers, so the mark follows the order the calls are made in
+static _Atomic(VkCommandBuffer) g_bt_after;   // the command buffer whose last recorded work is a full barrier (NULL: none)
+static int g_bt_on = 1, g_bt_never;   // g_bt_never: an entry point the merge does not know (vk_bt_init): off for good
+void vk_bar_merge_set(int on) { g_bt_on = on && !g_bt_never; }   // (gfx_vk_exec.c x_read)
+int vk_bar_redundant(VkCommandBuffer cb) { return g_bt_on && cb && atomic_load_explicit(&g_bt_after, memory_order_relaxed) == cb; }
+void vk_bar_recorded(VkCommandBuffer cb) { atomic_store_explicit(&g_bt_after, cb, memory_order_relaxed); }
+static inline void bt_work(void) { atomic_store_explicit(&g_bt_after, (VkCommandBuffer)NULL, memory_order_relaxed); }
+#define BT(f, P, A) static PFN_##f bt_r_##f; static VKAPI_ATTR void VKAPI_CALL bt_##f P { bt_work(); bt_r_##f A; }
+BT(vkCmdPipelineBarrier, (VkCommandBuffer cb, VkPipelineStageFlags s, VkPipelineStageFlags d, VkDependencyFlags f, uint32_t nm, const VkMemoryBarrier *m, uint32_t nb, const VkBufferMemoryBarrier *b,
+                          uint32_t ni, const VkImageMemoryBarrier *im), (cb, s, d, f, nm, m, nb, b, ni, im))
+BT(vkCmdCopyBuffer, (VkCommandBuffer cb, VkBuffer s, VkBuffer d, uint32_t n, const VkBufferCopy *r), (cb, s, d, n, r))
+BT(vkCmdCopyBufferToImage, (VkCommandBuffer cb, VkBuffer s, VkImage d, VkImageLayout l, uint32_t n, const VkBufferImageCopy *r), (cb, s, d, l, n, r))
+BT(vkCmdCopyImageToBuffer, (VkCommandBuffer cb, VkImage s, VkImageLayout l, VkBuffer d, uint32_t n, const VkBufferImageCopy *r), (cb, s, l, d, n, r))
+BT(vkCmdCopyImage, (VkCommandBuffer cb, VkImage s, VkImageLayout sl, VkImage d, VkImageLayout dl, uint32_t n, const VkImageCopy *r), (cb, s, sl, d, dl, n, r))
+BT(vkCmdBlitImage, (VkCommandBuffer cb, VkImage s, VkImageLayout sl, VkImage d, VkImageLayout dl, uint32_t n, const VkImageBlit *r, VkFilter f), (cb, s, sl, d, dl, n, r, f))
+BT(vkCmdFillBuffer, (VkCommandBuffer cb, VkBuffer d, VkDeviceSize o, VkDeviceSize n, uint32_t v), (cb, d, o, n, v))
+BT(vkCmdUpdateBuffer, (VkCommandBuffer cb, VkBuffer d, VkDeviceSize o, VkDeviceSize n, const void *p), (cb, d, o, n, p))
+BT(vkCmdClearColorImage, (VkCommandBuffer cb, VkImage i, VkImageLayout l, const VkClearColorValue *c, uint32_t n, const VkImageSubresourceRange *r), (cb, i, l, c, n, r))
+BT(vkCmdClearDepthStencilImage, (VkCommandBuffer cb, VkImage i, VkImageLayout l, const VkClearDepthStencilValue *c, uint32_t n, const VkImageSubresourceRange *r), (cb, i, l, c, n, r))
+BT(vkCmdClearAttachments, (VkCommandBuffer cb, uint32_t na, const VkClearAttachment *a, uint32_t nr, const VkClearRect *r), (cb, na, a, nr, r))
+BT(vkCmdResolveImage, (VkCommandBuffer cb, VkImage s, VkImageLayout sl, VkImage d, VkImageLayout dl, uint32_t n, const VkImageResolve *r), (cb, s, sl, d, dl, n, r))
+BT(vkCmdBeginRenderPass, (VkCommandBuffer cb, const VkRenderPassBeginInfo *b, VkSubpassContents c), (cb, b, c))
+BT(vkCmdEndRenderPass, (VkCommandBuffer cb), (cb))
+BT(vkCmdBeginRendering, (VkCommandBuffer cb, const VkRenderingInfo *i), (cb, i))
+BT(vkCmdEndRendering, (VkCommandBuffer cb), (cb))
+BT(vkCmdDraw, (VkCommandBuffer cb, uint32_t vc, uint32_t ic, uint32_t fv, uint32_t fi), (cb, vc, ic, fv, fi))
+BT(vkCmdDrawIndexed, (VkCommandBuffer cb, uint32_t ic, uint32_t n, uint32_t fi, int32_t vo, uint32_t fn), (cb, ic, n, fi, vo, fn))
+BT(vkCmdDrawIndirect, (VkCommandBuffer cb, VkBuffer b, VkDeviceSize o, uint32_t n, uint32_t s), (cb, b, o, n, s))
+BT(vkCmdDrawIndexedIndirect, (VkCommandBuffer cb, VkBuffer b, VkDeviceSize o, uint32_t n, uint32_t s), (cb, b, o, n, s))
+BT(vkCmdDispatch, (VkCommandBuffer cb, uint32_t x, uint32_t y, uint32_t z), (cb, x, y, z))
+BT(vkCmdDispatchIndirect, (VkCommandBuffer cb, VkBuffer b, VkDeviceSize o), (cb, b, o))
+BT(vkCmdResetQueryPool, (VkCommandBuffer cb, VkQueryPool q, uint32_t f, uint32_t n), (cb, q, f, n))
+BT(vkCmdWriteTimestamp, (VkCommandBuffer cb, VkPipelineStageFlagBits s, VkQueryPool q, uint32_t i), (cb, s, q, i))
+BT(vkCmdBeginTransformFeedbackEXT, (VkCommandBuffer cb, uint32_t f, uint32_t n, const VkBuffer *b, const VkDeviceSize *o), (cb, f, n, b, o))
+BT(vkCmdEndTransformFeedbackEXT, (VkCommandBuffer cb, uint32_t f, uint32_t n, const VkBuffer *b, const VkDeviceSize *o), (cb, f, n, b, o))
+BT(vkCmdDrawIndirectCount, (VkCommandBuffer cb, VkBuffer b, VkDeviceSize o, VkBuffer c, VkDeviceSize co, uint32_t m, uint32_t s), (cb, b, o, c, co, m, s))
+BT(vkCmdDrawIndexedIndirectCount, (VkCommandBuffer cb, VkBuffer b, VkDeviceSize o, VkBuffer c, VkDeviceSize co, uint32_t m, uint32_t s), (cb, b, o, c, co, m, s))
+BT(vkCmdDrawMeshTasksEXT, (VkCommandBuffer cb, uint32_t x, uint32_t y, uint32_t z), (cb, x, y, z))
+BT(vkCmdDispatchBase, (VkCommandBuffer cb, uint32_t bx, uint32_t by, uint32_t bz, uint32_t x, uint32_t y, uint32_t z), (cb, bx, by, bz, x, y, z))
+static PFN_vkBeginCommandBuffer bt_r_vkBeginCommandBuffer;
+static VKAPI_ATTR VkResult VKAPI_CALL bt_vkBeginCommandBuffer(VkCommandBuffer cb, const VkCommandBufferBeginInfo *bi) {
+    VkCommandBuffer x = cb; atomic_compare_exchange_strong(&g_bt_after, &x, (VkCommandBuffer)NULL); return bt_r_vkBeginCommandBuffer(cb, bi); }
+// (not wrapped, as they record no work: vkCmdBindPipeline, BindDescriptorSets, BindVertexBuffers, BindIndexBuffer, SetViewport, SetScissor, SetBlendConstants, SetStencil*, SetDepthBias,
+// SetLineWidth, PushConstants, BindTransformFeedbackBuffersEXT)
+#define BT_CMDS(X) X(vkCmdPipelineBarrier) X(vkCmdCopyBuffer) X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer) X(vkCmdCopyImage) X(vkCmdBlitImage) X(vkCmdFillBuffer) X(vkCmdUpdateBuffer) \
+    X(vkCmdClearColorImage) X(vkCmdClearDepthStencilImage) X(vkCmdClearAttachments) X(vkCmdResolveImage) X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass) X(vkCmdBeginRendering) X(vkCmdEndRendering) \
+    X(vkCmdDraw) X(vkCmdDrawIndexed) X(vkCmdDrawIndirect) X(vkCmdDrawIndexedIndirect) X(vkCmdDispatch) X(vkCmdDispatchIndirect) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) \
+    X(vkCmdBeginTransformFeedbackEXT) X(vkCmdEndTransformFeedbackEXT) X(vkCmdDrawIndirectCount) X(vkCmdDrawIndexedIndirectCount) X(vkCmdDrawMeshTasksEXT) X(vkCmdDispatchBase) X(vkBeginCommandBuffer)
+#define BT_STATE "vkCmdBindPipeline", "vkCmdBindDescriptorSets", "vkCmdBindVertexBuffers", "vkCmdBindIndexBuffer", "vkCmdSetViewport", "vkCmdSetScissor", "vkCmdSetBlendConstants", \
+    "vkCmdSetStencilReference", "vkCmdSetStencilCompareMask", "vkCmdSetStencilWriteMask", "vkCmdSetDepthBias", "vkCmdSetLineWidth", "vkCmdPushConstants", "vkCmdBindTransformFeedbackBuffersEXT"
+int vk_bt_known(const char *f) {   // a vkCmd* entry point the merge knows: wrapped (it records work) or state only. 0: an unknown one, which turns merging off
+#define BT_NAME(f) #f,
+    static const char *const k[] = {BT_CMDS(BT_NAME) BT_STATE};
+#undef BT_NAME
+    for (size_t i = 0; i < sizeof k / sizeof *k; i++) if (!strcmp(f, k[i])) return 1;
+    return 0;
+}
+void vk_bt_init(void) {   // vk_init, after vk_dq_init (the wrappers go over the two-stage replay's)
+#define BT_NAME(f) #f,
+    static const char *const all[] = {VK_DEV_FNS(BT_NAME)};   // a vkCmd* entry point added to gfx_vk.h but not here could record work unseen: merging is then never done
+#undef BT_NAME
+    for (size_t i = 0; i < sizeof all / sizeof *all; i++) if (!strncmp(all[i], "vkCmd", 5) && !vk_bt_known(all[i])) { g_bt_never = 1; g_bt_on = 0;
+        VKLOG("[RED] %s is not known to the barrier merge (gfx_vk_dq.c BT_CMDS, BT_STATE): full barriers are all recorded", all[i]); }
+#define BT_SWAP(f) bt_r_##f = f; if (bt_r_##f) f = bt_##f;
+    BT_CMDS(BT_SWAP)
+#undef BT_SWAP
+}
+// ---- end of full barriers back to back ----
 void vk_dq_init(void) {   // vk_init, after the device's entry points are loaded
     const char *e = getenv("DM_VK_MT_REPLAY"); if (!(e && atoi(e) > 0)) return;
     pthread_spin_init(&g_pl, PTHREAD_PROCESS_PRIVATE);

@@ -1,0 +1,6 @@
+# Test fixture (dm/tools/tests): the rows of upstream's profile 01007BB017812000 that shader_split.py reads; nx2android has no profile of this game
+title_id	01007BB017812000
+program_id	01007BB017812000
+name	Portal
+shader_groups	/game.zip/=game
+shader_note	Portal shaders

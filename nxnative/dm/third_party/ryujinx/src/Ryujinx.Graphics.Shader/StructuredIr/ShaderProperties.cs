@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 
 namespace Ryujinx.Graphics.Shader.StructuredIr
@@ -17,6 +18,29 @@ namespace Ryujinx.Graphics.Shader.StructuredIr
         public IReadOnlyDictionary<SetBindingPair, TextureDefinition> Images => _images;
         public IReadOnlyDictionary<int, MemoryDefinition> LocalMemories => _localMemories;
         public IReadOnlyDictionary<int, MemoryDefinition> SharedMemories => _sharedMemories;
+
+        // nxnative: a global memory access traced to no storage buffer goes through a physical storage buffer pointer (GlobalToStorage.TryGenerateRawStorageOp)
+        public bool UsesPhysicalPointers { get; set; }
+
+        // nx2android: shared memory past the host's limit (IGpuAccessor.QueryHostSharedMemoryLimit) lies in the storage buffer of this binding, SharedMemorySpillWords words
+        // a workgroup in SharedMemorySpillSlices slices (TranslatorContext.Translate; CodeGen/Spirv Declarations.DeclareSharedMemorySpill); -1: in workgroup memory
+        public int SharedMemorySpillBinding { get; set; } = -1;
+        public int SharedMemorySpillWords { get; set; }
+        public int SharedMemorySpillSlices { get; set; }
+
+        // nx2android: with one shared memory, its first SharedMemorySpillKeep words stay in workgroup memory and the buffer's slice holds the others (IGpuAccessor.QueryHostSharedMemorySpillKeep)
+        public int SharedMemorySpillKeep { get; set; }
+
+        // nx2android: float min / max / clamp written as NMin / NMax / NClamp (IGpuAccessor.QueryHostNanSafeMinMax)
+        public bool NanSafeMinMax { get; set; }
+
+        // nx2android: the HMMA helper's body in packed half arithmetic (IGpuAccessor.QueryHostHmmaF16; CodeGen/Spirv TensorF16)
+        public bool HmmaF16 { get; set; }
+
+        // nx2android: written as a Vulkan task or mesh shader around the compute body (IGpuAccessor.QueryHostMeshStage; CodeGen/Spirv/MeshStage.cs), with the uniform buffer of
+        // this binding that holds the draw's first task or mesh workgroup in its word 0
+        public MeshStageInfo MeshStage { get; set; }
+        public int MeshFirstBinding { get; set; } = -1;
 
         public ShaderProperties()
         {
@@ -90,7 +114,7 @@ namespace Ryujinx.Graphics.Shader.StructuredIr
             return format is TextureFormat.R32Sint or TextureFormat.R32Uint;
         }
 
-        public static TextureFormat GetTextureFormatAtomic(IGpuAccessor gpuAccessor, int handle, int cbufSlot = -1)
+        public static TextureFormat GetTextureFormatAtomic(IGpuAccessor gpuAccessor, int handle, int cbufSlot = -1, bool strict = false)
         {
             // Atomic image instructions do not support GL_EXT_shader_image_load_formatted,
             // and must have a type specified. Default to R32Sint if not available.
@@ -99,6 +123,11 @@ namespace Ryujinx.Graphics.Shader.StructuredIr
 
             if (!FormatSupportsAtomic(format))
             {
+                if (strict)
+                {
+                    throw new NotSupportedException($"Metal image atomics require an R32 integer descriptor format, got {format}.");
+                }
+
                 gpuAccessor.Log($"Unsupported format for texture {handle}: {format}.");
 
                 format = TextureFormat.R32Sint;

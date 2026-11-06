@@ -13,15 +13,19 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Glsl.Instructions
             AggregateType dstType = GetSrcVarType(operation.Inst, 0);
 
             string arg = GetSourceExpr(context, operation.GetSource(0), dstType);
-            char component = "xyzw"[operation.Index];
+
+            // nx2android: a second source picks the word at run time (EmitterContext.BallotWord)
+            string component = operation.SourcesCount > 1
+                ? $"[{GetSourceExpr(context, operation.GetSource(1), GetSrcVarType(operation.Inst, 1))}]"
+                : $".{"xyzw"[operation.Index]}";
 
             if (context.HostCapabilities.SupportsShaderBallot)
             {
-                return $"unpackUint2x32(ballotARB({arg})).{component}";
+                return $"unpackUint2x32(ballotARB({arg})){component}";
             }
             else
             {
-                return $"subgroupBallot({arg}).{component}";
+                return $"subgroupBallot({arg}){component}";
             }
         }
     }

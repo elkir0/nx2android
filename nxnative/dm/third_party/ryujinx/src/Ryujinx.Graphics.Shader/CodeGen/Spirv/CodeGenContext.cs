@@ -155,6 +155,7 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
             mainInterface.AddRange(Outputs.Values);
             mainInterface.AddRange(InputsPerPatch.Values);
             mainInterface.AddRange(OutputsPerPatch.Values);
+            mainInterface.AddRange(ExtraInterface);
 
             return mainInterface.ToArray();
         }

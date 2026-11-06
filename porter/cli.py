@@ -11,8 +11,9 @@ def _parser():
     i = sub.add_parser('inspect', help='what a game folder holds and whether it can be ported'); i.add_argument('folder'); i.add_argument('--json', action='store_true')
     i.add_argument('-k', '--keys', help='prod.keys (default: the configured one): reads the title ID of a dump with no [title ID] in its name')
     po = sub.add_parser('port', help='make the APK and the data pack (and install them)')
-    po.add_argument('folder', help='the game\'s folder: its base game NSP / XCI / NSZ / XCZ, updates and DLC')
-    po.add_argument('-k', '--keys', help='prod.keys (default: the configured one)')
+    po.add_argument('folder', help='the game\'s folder: its base game NSP / XCI / NSZ / XCZ, updates and DLC, or one NUP container (.nup: the file may be given instead), '
+                    'or a dump folder (base/exefs, base/romfs, updates/<version>/, dlc/)')
+    po.add_argument('-k', '--keys', help='prod.keys (default: the configured one; a NUP or a dump folder needs none)')
     po.add_argument('-o', '--out', help='folder for the APK and the data pack (default: the game folder)')
     po.add_argument('-p', '--version', default='', help='version to pack, v<N> (default: the newest in the folder)')
     po.add_argument('-l', '--language', default='', help='game language, a code or a name (default: English)')
@@ -94,7 +95,8 @@ def cmd_inspect(a):
         else: print(e, file=sys.stderr)
         return 2
     if a.json: _print_json(info); return 0 if info['supported'] else 2
-    print(f'{info["title_id"]}  {info.get("name", "")}\n  base: {info["base"]}')
+    print(f'{info["title_id"]}  {info.get("name", "")}' + {'nup': '  (a NUP: no keys needed)', 'dump': '  (a dump folder: no keys needed)'}.get(info.get('kind'), ''))
+    print(f'  base: {info["base"]}' if info['base'] else f'  base: none ({info.get("note", "")})')
     for u in info['updates']: print(f'  update {u["version"]}: {u["file"]}')
     for d in info['dlc']: print(f'  DLC {d["title_id"]}: {d["file"]}')
     if info.get('pack'): print(f'  packs {info["pack"]} (versions in the folder: {", ".join(info["versions"])})')

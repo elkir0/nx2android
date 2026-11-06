@@ -1,7 +1,7 @@
 # The tools a port needs on the player's machine, found and checked (`porter doctor`, the GUI's setup screen). Nothing here is shipped with the tool:
 # the player installs the Android NDK (r27c), the .NET SDK (10) and, to install from the tool, platform-tools (adb), or has `porter tools --download` (porter.fetch)
 # fetch them from Google and Microsoft into their nx2android folder (paths.player_tools()), which the finders here also search.
-import glob, importlib.util, os, re, shutil, subprocess, sys
+import glob, importlib.metadata, importlib.util, os, re, shutil, subprocess, sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -104,6 +104,9 @@ def checks(cfg=None, keys=None):
     out.append(Check('Python', v >= (3, 11), f'{v.major}.{v.minor}.{v.micro} ({sys.executable})', fix='Python 3.11 or later'))
     miss = [pip for m, pip in PY_MODULES.items() if not _importable(m)]
     if not (_importable('compression.zstd') or _importable('backports.zstd')): miss.append('backports.zstd')   # zstd: in the standard library from Python 3.14
+    try: cap = importlib.metadata.version('capstone')
+    except importlib.metadata.PackageNotFoundError: cap = None
+    if cap and cap.split('.')[0] != '5': miss.append(f'"capstone>=5,<6" (not {cap}: the rewriter refuses another major version)')
     out.append(Check('Python modules', not miss, 'missing: ' + ', '.join(miss) if miss else 'lz4, capstone, zstd', fix='pip install ' + ' '.join(miss) if miss else ''))
     out.append(Check('Pillow', _importable('PIL'), 'the app icon from the game\'s icon' if _importable('PIL') else 'missing: the app gets no icon', required=False, fix='pip install pillow'))
     aes = _importable('Crypto.Cipher') or _importable('Cryptodome.Cipher')
@@ -131,10 +134,10 @@ def checks(cfg=None, keys=None):
     return out
 
 
-def require(cfg=None, keys=None, adb=False):
-    """The checked tools for a port: {'ndk', 'dotnet', 'adb'}; ToolError naming every missing requirement"""
+def require(cfg=None, keys=None, adb=False, need_keys=True):
+    """The checked tools for a port: {'ndk', 'dotnet', 'adb'}; ToolError naming every missing requirement. need_keys False: a dump folder (porter.dumpdir) decrypts nothing"""
     rows = checks(cfg, keys)
-    bad = [r for r in rows if not r.ok and (r.required or (adb and r.name == 'adb'))]
+    bad = [r for r in rows if not r.ok and (r.required or (adb and r.name == 'adb')) and (need_keys or r.name != 'prod.keys')]
     if bad: raise ToolError('missing requirements: ' + '; '.join(f'{r.name}: {r.detail}' + (f' ({r.fix})' if r.fix else '') for r in bad))
     by = {r.name: r for r in rows}
     return {'ndk': Path(by['Android NDK'].path), 'dotnet': Path(by['.NET SDK'].path), 'adb': Path(by['adb'].path) if by['adb'].ok else None}

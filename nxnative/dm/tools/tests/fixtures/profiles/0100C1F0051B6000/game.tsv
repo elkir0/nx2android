@@ -1,0 +1,6 @@
+# Test fixture (dm/tools/tests): the rows of upstream's profile 0100C1F0051B6000 that shader_split.py reads; nx2android has no profile of this game
+title_id	0100C1F0051B6000
+program_id	0100C1F0051B6000
+name	Donkey Kong Country: Tropical Freeze
+shader_groups	/MaterialArchive.arc=material /PreLoadPak.pak=preload /Worlds/=worlds /UI/=ui
+shader_note	Donkey Kong Country: Tropical Freeze shaders

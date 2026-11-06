@@ -42,6 +42,7 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
             Add(Instruction.AtomicXor,                GenerateAtomicXor);
             Add(Instruction.Ballot,                   GenerateBallot);
             Add(Instruction.Barrier,                  GenerateBarrier);
+            Add(Instruction.SubgroupBarrier,          GenerateSubgroupBarrier);
             Add(Instruction.BitCount,                 GenerateBitCount);
             Add(Instruction.BitfieldExtractS32,       GenerateBitfieldExtractS32);
             Add(Instruction.BitfieldExtractU32,       GenerateBitfieldExtractU32);
@@ -232,7 +233,11 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
             SpvInstruction execution = context.Constant(context.TypeU32(), Scope.Subgroup);
 
             SpvInstruction maskVector = context.GroupNonUniformBallot(uvec4Type, execution, context.Get(AggregateType.Bool, source));
-            SpvInstruction mask = context.CompositeExtract(context.TypeU32(), maskVector, (SpvLiteralInteger)operation.Index);
+
+            // nx2android: a second source picks the word at run time (EmitterContext.BallotWord)
+            SpvInstruction mask = operation.SourcesCount > 1
+                ? context.VectorExtractDynamic(context.TypeU32(), maskVector, context.Get(AggregateType.U32, operation.GetSource(1)))
+                : context.CompositeExtract(context.TypeU32(), maskVector, (SpvLiteralInteger)operation.Index);
 
             return new OperationResult(AggregateType.U32, mask);
         }
@@ -252,7 +257,18 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
             context.ControlBarrier(
                 context.Constant(context.TypeU32(), Scope.Workgroup),
                 context.Constant(context.TypeU32(), Scope.Workgroup),
-                context.Constant(context.TypeU32(), MemorySemanticsMask.WorkgroupMemory | MemorySemanticsMask.AcquireRelease));
+                context.Constant(context.TypeU32(), SharedMemorySpill.Semantics(context, MemorySemanticsMask.WorkgroupMemory | MemorySemanticsMask.AcquireRelease)));
+
+            return OperationResult.Invalid;
+        }
+
+        // nxnative: the lanes of one subgroup (Metal: simdgroup_barrier), with their workgroup memory accesses ordered
+        private static OperationResult GenerateSubgroupBarrier(CodeGenContext context, AstOperation operation)
+        {
+            context.ControlBarrier(
+                context.Constant(context.TypeU32(), Scope.Subgroup),
+                context.Constant(context.TypeU32(), Scope.Subgroup),
+                context.Constant(context.TypeU32(), SharedMemorySpill.Semantics(context, MemorySemanticsMask.WorkgroupMemory | MemorySemanticsMask.AcquireRelease)));
 
             return OperationResult.Invalid;
         }
@@ -333,7 +349,8 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
 
         private static OperationResult GenerateClamp(CodeGenContext context, AstOperation operation)
         {
-            return GenerateTernary(context, operation, context.Delegates.GlslFClamp, context.Delegates.GlslSClamp);
+            // nx2android: NClamp where a NaN must give the other bound, as Maxwell's .SAT gives 0 (ShaderProperties.NanSafeMinMax)
+            return GenerateTernary(context, operation, context.Properties.NanSafeMinMax ? context.GlslNClamp : context.Delegates.GlslFClamp, context.Delegates.GlslSClamp);
         }
 
         private static OperationResult GenerateClampU32(CodeGenContext context, AstOperation operation)
@@ -622,6 +639,24 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
             ImageDeclaration declaration = context.Images[texOp.GetTextureSetAndBinding()];
             SpvInstruction image = declaration.Image;
 
+            bool bounded = context.HostCapabilities.MetalImageAtomics;
+            // CAS is a native texture compare-exchange on Metal (SPIRV-Cross loops
+            // atomic_compare_exchange_weak into a strong one), so it takes the same guard.
+            if (bounded && ((texOp.Flags & TextureFlags.AtomicBoundsMask) != 0 ||
+                texOp.Flags.HasFlag(TextureFlags.AtomicPredicateResult)))
+            {
+                throw new NotSupportedException("Metal image atomics require IGN without a predicate result; TRAP semantics are not implemented.");
+            }
+            // Metal's texture atomics (MSL 3.1) cover buffer, 2D, 2D-array and 3D textures of
+            // R32Uint / R32Sint; source 1D surfaces arrive here already normalized to 2D.
+            if (bounded && (declaration.IsIndexed ||
+                (texOp.Type != SamplerType.TextureBuffer && texOp.Type != SamplerType.Texture2D &&
+                 texOp.Type != (SamplerType.Texture2D | SamplerType.Array) && texOp.Type != SamplerType.Texture3D) ||
+                (texOp.Format != TextureFormat.R32Uint && texOp.Format != TextureFormat.R32Sint)))
+            {
+                throw new NotSupportedException("Metal image atomics support non-indexed 32-bit buffer/2D/2D-array/3D images only.");
+            }
+
             SpvInstruction resultType = context.GetType(componentType);
             SpvInstruction imagePointerType = context.TypePointer(StorageClass.Image, resultType);
 
@@ -658,6 +693,37 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
 
             SpvInstruction value = Src(componentType);
 
+            SpvInstruction merge = null;
+            SpvInstruction valid = null;
+            SpvInstruction invalid = null;
+            if (bounded)
+            {
+                // Test each original coordinate, including the array layer, before
+                // constructing a raw pointer. Unsigned comparison also rejects
+                // negative signed coordinates; a final linear-index check would not.
+                SpvInstruction uintType = context.TypeU32();
+                SpvInstruction coordType = pCount == 1 ? uintType : context.TypeVector(uintType, pCount);
+                SpvInstruction boolType = context.TypeBool();
+                SpvInstruction compareType = pCount == 1 ? boolType : context.TypeVector(boolType, pCount);
+                SpvInstruction coords = context.Bitcast(coordType, pCoords);
+                SpvInstruction loaded = context.Load(declaration.ImageType, image);
+                SpvInstruction extent = context.ImageQuerySize(coordType, loaded);
+                SpvInstruction inside = context.ULessThan(compareType, coords, extent);
+                if (pCount != 1)
+                {
+                    inside = context.All(boolType, inside);
+                }
+
+                valid = context.Label();
+                merge = context.Label();
+                invalid = texOp.Flags.HasFlag(TextureFlags.AtomicDiscardResult) ? merge : context.Label();
+                context.SelectionMerge(merge, SelectionControlMask.MaskNone);
+                context.BranchConditional(inside, valid, invalid);
+                context.AddLabel(valid);
+
+
+            }
+
             SpvInstruction pointer = context.ImageTexelPointer(imagePointerType, image, pCoords, context.Constant(context.TypeU32(), 0));
             SpvInstruction one = context.Constant(context.TypeU32(), 1);
             SpvInstruction zero = context.Constant(context.TypeU32(), 0);
@@ -681,6 +747,25 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
                 _ => context.AtomicIAdd(resultType, pointer, one, zero, value),
             };
 
+            if (bounded)
+            {
+                context.Branch(merge);
+                if (texOp.Flags.HasFlag(TextureFlags.AtomicDiscardResult))
+                {
+                    context.AddLabel(merge);
+                    result = context.Constant(resultType, 0);
+                }
+                else
+                {
+                    // IGN image atomics leave memory alone and return zero outside
+                    // the image (ARB_shader_image_load_store, issue 30). Inside it,
+                    // return the actual old texel, as Unreal's particle counters need.
+                    context.AddLabel(invalid);
+                    context.Branch(merge);
+                    context.AddLabel(merge);
+                    result = context.Phi(resultType, result, valid, context.Constant(resultType, 0), invalid);
+                }
+            }
             return new OperationResult(componentType, result);
         }
 
@@ -742,6 +827,13 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
 
             SpvInstruction imageComponentType = context.GetType(componentType);
             AggregateType swizzledResultType = texOp.GetVectorType(componentType);
+
+            // nx2android: a read of an image of unknown format needs the capability, as a store does (Declarations.DeclareImages; the host enables the device's
+            // shaderStorageImageReadWithoutFormat). 88 of Mario Kart World 1.8.0's shaders, whose image formats no answer table gives, failed spirv-val without it
+            if (texOp.Format == TextureFormat.Unknown && !context.HasCapability(Capability.StorageImageReadWithoutFormat))
+            {
+                context.AddCapability(Capability.StorageImageReadWithoutFormat);
+            }
 
             SpvInstruction texel = context.ImageRead(context.TypeVector(imageComponentType, 4), image, pCoords, ImageOperandsMask.MaskNone);
             SpvInstruction result = GetSwizzledResult(context, texel, swizzledResultType, texOp.Index);
@@ -953,7 +1045,8 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
 
         private static OperationResult GenerateMaximum(CodeGenContext context, AstOperation operation)
         {
-            return GenerateBinary(context, operation, context.Delegates.GlslFMax, context.Delegates.GlslSMax);
+            // nx2android: NMax where a NaN operand must give the other one, as Maxwell's FMNMX (ShaderProperties.NanSafeMinMax)
+            return GenerateBinary(context, operation, context.Properties.NanSafeMinMax ? context.GlslNMax : context.Delegates.GlslFMax, context.Delegates.GlslSMax);
         }
 
         private static OperationResult GenerateMaximumU32(CodeGenContext context, AstOperation operation)
@@ -969,7 +1062,8 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
 
         private static OperationResult GenerateMinimum(CodeGenContext context, AstOperation operation)
         {
-            return GenerateBinary(context, operation, context.Delegates.GlslFMin, context.Delegates.GlslSMin);
+            // nx2android: NMin where a NaN operand must give the other one, as Maxwell's FMNMX (ShaderProperties.NanSafeMinMax)
+            return GenerateBinary(context, operation, context.Properties.NanSafeMinMax ? context.GlslNMin : context.Delegates.GlslFMin, context.Delegates.GlslSMin);
         }
 
         private static OperationResult GenerateMinimumU32(CodeGenContext context, AstOperation operation)
@@ -1687,6 +1781,18 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
             AstOperation operation,
             Func<SpvInstruction, SpvInstruction, SpvInstruction, SpvInstruction, SpvInstruction, SpvInstruction> emitU)
         {
+            // nx2android: shared memory split between workgroup memory and a buffer (SharedMemorySpill.Split)
+            if (SharedMemorySpill.IsSplit(context, operation))
+            {
+                SpvInstruction u32 = context.TypeU32();
+                SpvInstruction index = SharedMemorySpill.SplitIndex(context, operation);
+                SpvInstruction operand = context.Get(AggregateType.U32, operation.GetSource(operation.SourcesCount - 1));
+                SpvInstruction device = context.Constant(u32, 1);
+                SpvInstruction none = context.Constant(u32, 0);
+
+                return new OperationResult(AggregateType.U32, SharedMemorySpill.Split(context, index, u32, p => emitU(u32, p, device, none, operand)));
+            }
+
             SpvInstruction elemPointer = GetStoragePointer(context, operation, out AggregateType varType);
 
             SpvInstruction value = context.Get(varType, operation.GetSource(operation.SourcesCount - 1));
@@ -1699,6 +1805,19 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
 
         private static OperationResult GenerateAtomicMemoryCas(CodeGenContext context, AstOperation operation)
         {
+            // nx2android: shared memory split between workgroup memory and a buffer (SharedMemorySpill.Split)
+            if (SharedMemorySpill.IsSplit(context, operation))
+            {
+                SpvInstruction u32 = context.TypeU32();
+                SpvInstruction index = SharedMemorySpill.SplitIndex(context, operation);
+                SpvInstruction compare = context.Get(AggregateType.U32, operation.GetSource(operation.SourcesCount - 2));
+                SpvInstruction operand = context.Get(AggregateType.U32, operation.GetSource(operation.SourcesCount - 1));
+                SpvInstruction device = context.Constant(u32, 1);
+                SpvInstruction none = context.Constant(u32, 0);
+
+                return new OperationResult(AggregateType.U32, SharedMemorySpill.Split(context, index, u32, p => context.AtomicCompareExchange(u32, p, device, none, none, operand, compare)));
+            }
+
             SpvInstruction elemPointer = GetStoragePointer(context, operation, out AggregateType varType);
 
             SpvInstruction value0 = context.Get(varType, operation.GetSource(operation.SourcesCount - 2));
@@ -1712,16 +1831,49 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
 
         private static OperationResult GenerateLoadOrStore(CodeGenContext context, AstOperation operation, bool isStore)
         {
+            // nx2android: shared memory split between workgroup memory and a buffer (SharedMemorySpill.Split)
+            if (SharedMemorySpill.IsSplit(context, operation))
+            {
+                SpvInstruction u32 = context.TypeU32();
+                SpvInstruction index = SharedMemorySpill.SplitIndex(context, operation);
+
+                if (isStore)
+                {
+                    SpvInstruction value = context.Get(AggregateType.U32, operation.GetSource(operation.SourcesCount - 1));
+
+                    SharedMemorySpill.Split(context, index, null, p => { context.Store(p, value); return null; });
+
+                    return OperationResult.Invalid;
+                }
+
+                return new OperationResult(AggregateType.U32, SharedMemorySpill.Split(context, index, u32, p => context.Load(u32, p)));
+            }
+
             SpvInstruction pointer = GetStoragePointer(context, operation, out AggregateType varType);
+
+            // nxnative: a load or store through a physical storage buffer pointer must state its alignment (a 32-bit word)
+            bool physical = operation.StorageKind == StorageKind.GlobalMemory;
 
             if (isStore)
             {
-                context.Store(pointer, context.Get(varType, operation.GetSource(operation.SourcesCount - 1)));
+                SpvInstruction store = context.Store(pointer, context.Get(varType, operation.GetSource(operation.SourcesCount - 1)), physical ? MemoryAccessMask.Aligned : (MemoryAccessMask)int.MaxValue);
+
+                if (physical)
+                {
+                    store.AddOperand((SpvLiteralInteger)4);
+                }
+
                 return OperationResult.Invalid;
             }
             else
             {
-                SpvInstruction result = context.Load(context.GetType(varType), pointer);
+                SpvInstruction result = context.Load(context.GetType(varType), pointer, physical ? MemoryAccessMask.Aligned : (MemoryAccessMask)int.MaxValue);
+
+                if (physical)
+                {
+                    result.AddOperand((SpvLiteralInteger)4);
+                }
+
                 return new OperationResult(varType, result);
             }
         }
@@ -1737,6 +1889,20 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
 
             switch (storageKind)
             {
+                case StorageKind.GlobalMemory:
+                    // nxnative: an address traced to no storage buffer, already moved to the host's GPU address (GlobalToStorage.TryGenerateRawStorageOp):
+                    // a physical storage buffer pointer to its 32-bit word, from the address's low and high words
+                    SpvInstruction addressWords = context.CompositeConstruct(
+                        context.TypeVector(context.TypeU32(), 2),
+                        context.Get(AggregateType.U32, operation.GetSource(0)),
+                        context.Get(AggregateType.U32, operation.GetSource(1)));
+
+                    varType = AggregateType.U32;
+
+                    return context.ConvertUToPtr(
+                        context.TypePointer(StorageClass.PhysicalStorageBuffer, context.TypeU32()),
+                        context.Bitcast(context.TypeInt(64, 0), addressWords));
+
                 case StorageKind.ConstantBuffer:
                 case StorageKind.StorageBuffer:
                     if (operation.GetSource(srcIndex++) is not AstOperand bindingIndex || bindingIndex.Type != OperandType.Constant)
@@ -1754,7 +1920,7 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
                         : context.Properties.StorageBuffers[bindingIndex.Value];
                     StructureField field = buffer.Type.Fields[fieldIndex.Value];
 
-                    storageClass = StorageClass.Uniform;
+                    storageClass = storageKind == StorageKind.StorageBuffer ? context.StorageBufferClass : StorageClass.Uniform;
                     varType = field.Type & AggregateType.ElementTypeMask;
                     baseObj = storageKind == StorageKind.ConstantBuffer
                         ? context.ConstantBuffers[bindingIndex.Value]
@@ -1773,6 +1939,18 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
                         storageClass = StorageClass.Private;
                         varType = context.Properties.LocalMemories[bindingId.Value].Type & AggregateType.ElementTypeMask;
                         baseObj = context.LocalMemories[bindingId.Value];
+                    }
+                    else if (SharedMemorySpill.IsOn(context))
+                    {
+                        // nx2android: in the storage buffer (SharedMemorySpill), a word of an array of words
+                        varType = context.Properties.SharedMemories[bindingId.Value].Type & AggregateType.ElementTypeMask;
+
+                        if (operation.SourcesCount - srcIndex - (operation.Inst == Instruction.Store || operation.Inst.IsAtomic() ? 1 : 0) - (operation.Inst == Instruction.AtomicCompareAndSwap ? 1 : 0) != 1)
+                        {
+                            throw new InvalidOperationException($"{operation.Inst} on shared memory in a buffer with other than one index.");
+                        }
+
+                        return SharedMemorySpill.Pointer(context, bindingId.Value, context.Get(AggregateType.S32, operation.GetSource(srcIndex)));
                     }
                     else
                     {

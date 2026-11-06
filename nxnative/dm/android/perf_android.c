@@ -56,9 +56,19 @@ static void gpu_turbo(void) {
     if (r) { LOG("[RED] [perf] DM_GPU_TURBO=%d: the GPU's power control could not be set (%s)", want, strerror(errno)); return; }
     on = want; LOG("[perf] DM_GPU_TURBO=%d: %s", want, want ? "the GPU at its highest clock (power control off)" : "the GPU's own clock control again");
 }
+// The GPU's clock now, in MHz, for the log (dm_perf_frame, every 600 presents: the clocks the governor gives a game whose present interval switches, PARITY G9): KGSL's
+// gpuclk (Hz), else its devfreq cur_freq; -1 where the app may not read them (SELinux), and then not tried again
+static int gpu_mhz(void) {
+    static int off; if (off) return -1;
+    static const char *const f[] = {"/sys/class/kgsl/kgsl-3d0/gpuclk", "/sys/class/kgsl/kgsl-3d0/devfreq/cur_freq"};
+    for (int i = 0; i < 2; i++) { FILE *h = fopen(f[i], "r"); if (!h) continue; long long v = 0; int ok = fscanf(h, "%lld", &v) == 1; fclose(h); if (ok && v > 0) return (int)(v / 1000000); }
+    off = 1; return -1;
+}
 
+void dm_perf_replay_thread(void);
 static void hint_init(int64_t target) {
     static int tried; if (tried) return; tried = 1;
+    dm_perf_replay_thread();   // (the presenting thread replays: mtl_present runs on the thread that replays the frame, the game's own with DM_NVN_ASYNC off, as in Mario Kart World's run 13)
     gpu_turbo();
     if (getenv("DM_NO_ADPF")) return;
     void *lib = dlopen("libandroid.so", RTLD_NOW); if (!lib) return;
@@ -91,12 +101,13 @@ static uint64_t task_ticks(int tid) {
     for (char *t = c + 1; *t && field < 15; t++) if (*t == ' ') { field++; if (field == 14) ut = strtoull(t + 1, NULL, 10); else if (field == 15) st = strtoull(t + 1, NULL, 10); }
     return ut + st;
 }
+static void pin_threads(int tid);
 static void hint_threads_scan(int32_t self) {
     static struct { int tid; uint64_t ticks; } prev[512]; static int np; static int64_t last;
     int64_t now = perf_now(); double secs = last ? (now - last) / 1e9 : 0; last = now;
     DIR *d = opendir("/proc/self/task"); if (!d) return;
     struct { int tid; uint64_t used; } cur[512]; int nc = 0; struct dirent *e;
-    while ((e = readdir(d)) && nc < 512) { int tid = atoi(e->d_name); if (tid <= 0) continue; cur[nc].tid = tid; cur[nc].used = task_ticks(tid); nc++; }
+    while ((e = readdir(d)) && nc < 512) { int tid = atoi(e->d_name); if (tid <= 0) continue; cur[nc].tid = tid; cur[nc].used = task_ticks(tid); nc++; pin_threads(tid); }
     closedir(d);
     int32_t pick[8]; int npick = 0; pick[npick++] = self;
     if (secs > 0) {
@@ -124,20 +135,54 @@ static void hint_threads_scan(int32_t self) {
     LOG("[perf] ADPF session threads:%s", l);
 }
 
-// DM_PIN_REPLAY (start-up): the replay thread (DM_NVN_ASYNC, hle_nvn.c replay_main) kept to the fastest cores. prime: the cores of the highest maximum clock
-// (a Snapdragon 8+ Gen 1's Cortex-X2), big: every core above the lowest maximum clock. Left to the scheduler, Unicorn Overlord's battle map replay took
+// The cores of a kind (DM_PIN_REPLAY, DM_PIN_THREADS), ranked by cpu_capacity (the scheduler's measure: clock and core), else by maximum clock: prime, those of the highest;
+// big, every core above the lowest; rest, every core but the prime ones. SM8850 (2 prime Oryon cores, 6 performance ones at a lower clock): prime and big are the same
+// two cores, rest the six. Returns how many (0: unknown or all alike); l: their numbers, top: the highest maximum clock (MHz)
+static long cpu_long(long c, const char *what) { char p[96]; long v = 0; snprintf(p, sizeof p, "/sys/devices/system/cpu/cpu%ld/%s", c, what); FILE *f = fopen(p, "r"); if (f) { if (fscanf(f, "%ld", &v) != 1) v = 0; fclose(f); } return v; }
+static int pin_set(const char *kind, cpu_set_t *set, char *l, size_t ln, long *top) {
+    long n = sysconf(_SC_NPROCESSORS_CONF); if (n > 32) n = 32;
+    long cap[32] = {0}, mhz[32] = {0}, hi = 0, lo = 0; int ncap = 0, m = 0; size_t o = 0; *top = 0; if (ln) l[0] = 0;
+    for (long c = 0; c < n; c++) { cap[c] = cpu_long(c, "cpu_capacity"); mhz[c] = cpu_long(c, "cpufreq/cpuinfo_max_freq") / 1000; ncap += cap[c] > 0; if (mhz[c] > *top) *top = mhz[c]; }
+    const long *key = ncap == n ? cap : mhz;
+    for (long c = 0; c < n; c++) { if (key[c] > hi) hi = key[c]; if (key[c] && (!lo || key[c] < lo)) lo = key[c]; }
+    if (!hi || hi == lo) return 0;
+    int k = !strcmp(kind, "prime") ? 0 : !strcmp(kind, "rest") ? 2 : 1;
+    CPU_ZERO(set);
+    for (long c = 0; c < n; c++) if (key[c] && (k == 0 ? key[c] == hi : k == 2 ? key[c] < hi : key[c] > lo)) { CPU_SET(c, set); m++; if (o < ln) o += (size_t)snprintf(l + o, ln - o, " %ld", c); }
+    return m;
+}
+// DM_PIN_REPLAY (start-up): the thread that replays the frames kept to the fastest cores (prime, big or rest: pin_set): DM_NVN_ASYNC's replay thread (hle_nvn.c replay_main)
+// and the presenting thread (hint_init: the game's own render thread when the replay runs on it). Left to the scheduler, Unicorn Overlord's battle map replay took
 // 13 to 20 ms a frame from run to run with the same ~3,500 draws
 void dm_perf_replay_thread(void) {
+    static __thread int done; if (done) return; done = 1;
     const char *e = getenv("DM_PIN_REPLAY"); if (!e || !*e || !strcmp(e, "0")) return;
-    int prime = !strcmp(e, "prime"); long n = sysconf(_SC_NPROCESSORS_CONF); if (n > 32) n = 32;
-    long mhz[32] = {0}, hi = 0, lo = 0;
-    for (long c = 0; c < n; c++) { char p[96]; snprintf(p, sizeof p, "/sys/devices/system/cpu/cpu%ld/cpufreq/cpuinfo_max_freq", c); FILE *f = fopen(p, "r");
-        if (f) { if (fscanf(f, "%ld", &mhz[c]) != 1) mhz[c] = 0; fclose(f); } mhz[c] /= 1000; if (mhz[c] > hi) hi = mhz[c]; if (mhz[c] && (!lo || mhz[c] < lo)) lo = mhz[c]; }
-    if (!hi || hi == lo) { LOG("[perf] DM_PIN_REPLAY: the cores' clocks are unknown or all alike, not pinned"); return; }
-    cpu_set_t set; CPU_ZERO(&set); char l[96]; size_t o = 0;
-    for (long c = 0; c < n; c++) if (prime ? mhz[c] == hi : mhz[c] > lo) { CPU_SET(c, &set); o += snprintf(l + o, sizeof l - o, " %ld", c); }
+    const char *kind = !strcmp(e, "prime") ? "prime" : !strcmp(e, "rest") ? "rest" : "big"; cpu_set_t set; char l[96]; long hi;
+    if (!pin_set(kind, &set, l, sizeof l, &hi)) { LOG("[perf] DM_PIN_REPLAY: the cores' clocks are unknown or all alike, not pinned"); return; }
     if (sched_setaffinity(0, sizeof set, &set)) { LOG("[perf] DM_PIN_REPLAY: sched_setaffinity refused"); return; }
-    LOG("[perf] replay thread on CPUs%s (%s, up to %ld MHz)", l, prime ? "prime" : "big", hi);
+    LOG("[perf] replay thread %d on CPUs%s (%s, up to %ld MHz)", (int)gettid(), l, kind, hi);
+}
+// DM_PIN_THREADS (start-up): name=kind pairs, comma-separated ("vk record=rest,vk present=rest"): each thread whose name starts so is kept to those cores (pin_set) once
+// the thread scan sees it (hint_threads_scan: the first present, then every 300). The port's own threads have fixed names (the two-stage replay's recorder "vk record",
+// DM_VK_MT_REPLAY; "vk present"); a game's threads are named by the game (its guest names, hle_thread.c)
+static void pin_threads(int tid) {
+    static const char *spec; static int init; if (!init) { init = 1; spec = getenv("DM_PIN_THREADS"); if (spec && !*spec) spec = NULL; }
+    if (!spec) return;
+    static int seen[64]; static int ns; for (int i = 0; i < ns; i++) if (seen[i] == tid) return;
+    char p[64], name[32] = {0}; snprintf(p, sizeof p, "/proc/self/task/%d/comm", tid); FILE *f = fopen(p, "r"); if (!f) return;
+    if (!fgets(name, sizeof name, f)) name[0] = 0; fclose(f); name[strcspn(name, "\n")] = 0; if (!name[0]) return;
+    for (const char *c = spec; *c; ) {
+        const char *eq = strchr(c, '='), *end = strchr(c, ','); if (!end) end = c + strlen(c);
+        if (eq && eq > c && eq < end && !strncmp(name, c, (size_t)(eq - c))) {
+            char kind[16]; snprintf(kind, sizeof kind, "%.*s", (int)(end - eq - 1), eq + 1); cpu_set_t set; char l[96]; long hi;
+            if (ns < 64) seen[ns++] = tid;
+            if (!pin_set(kind, &set, l, sizeof l, &hi)) { LOG("[perf] DM_PIN_THREADS: the cores' clocks are unknown or all alike, %s not pinned", name); return; }
+            if (sched_setaffinity(tid, sizeof set, &set)) LOG("[perf] DM_PIN_THREADS: sched_setaffinity refused for %d (%s)", tid, name);
+            else LOG("[perf] thread %d (%s) on CPUs%s (%s)", tid, name, l, kind);
+            return;
+        }
+        c = *end ? end + 1 : end;
+    }
 }
 
 static int64_t g_work_start;
@@ -177,6 +222,7 @@ void dm_perf_frame_cost(int64_t replay_ns, int64_t gpu_ns) { g_frame_cost = repl
 // to 30-45 fps with the GPU at 222-443 MHz in the same scene; that device's GPU clock moved only with its FULL performance mode or its game menu, hints or not)
 // pq: the wait for the present thread, left out of the CPU time where the GPU's time goes beside it (blocked, not CPU work); pace: the part of it that is a
 // longer step's pacing, left out of the work judged over the period (counted, every frame at 40 or 30 fps was over the game's period and signalled)
+static unsigned g_hint_inc[2], g_hint_updates;   // load increases signalled (all, with the GPU's), target changes: the log every 600 presents (dm_perf_frame)
 static void hint_report(int64_t w, int64_t pq, int64_t pace, int64_t now, int64_t target) {
     if (H.report2) {
         AWorkDuration *d = g_wd;
@@ -186,7 +232,7 @@ static void hint_report(int64_t w, int64_t pq, int64_t pace, int64_t now, int64_
     int64_t worst = w - pace > g_frame_gpu ? w - pace : g_frame_gpu;
     over = worst > target * 105 / 100 ? over + 1 : 0;
     if (H.increase && over >= 3 && now - last > 500000000ll) {
-        last = now; int r = H.increase(g_hint, true, g_frame_gpu > target * 70 / 100, "frame over its period");
+        last = now; int gpu = g_frame_gpu > target * 70 / 100, r = H.increase(g_hint, true, gpu, "frame over its period"); g_hint_inc[0]++; g_hint_inc[1] += gpu;
         static int n; if (n++ < 5) LOG("[perf] ADPF load increase signalled (work %.1f ms, GPU %.1f ms, target %.1f ms)%s", w / 1e6, g_frame_gpu / 1e6, target / 1e6, r ? " refused" : "");
     }
 }
@@ -261,6 +307,12 @@ void dm_perf_frame(double period) {
     // the CPU hint's target is the game's own period, not the adaptive one: with the longer target the CPU clocks drop until the work fills it,
     // and the work then never shows the room to step back up (NEO stayed at 30 fps with frames of 31 to 48 ms)
     if (g_game_period && (int64_t)g_game_period < p) p = (int64_t)g_game_period;
+    // DM_ADPF_TARGET (start-up): short (default), the shortest period the game asked for in the last 2 s; game, each frame's own (before). Mario Kart World switches its
+    // present interval between 1 and 2 about 1,400 times a race (PARITY G9, main+0x69ce28) and the target followed it (run 13 signalled load increases against 16.7 and
+    // 33.3 ms): each switch was an updateTargetWorkDuration call, and each frame at interval 2 reset the count of frames over the period (34 ms of GPU is not over 33.3 + 5%),
+    // so frames of 34 ms of GPU time at a 16.7 ms period rarely made the 3 in a row that signal a load increase. A game that stays at the longer period has it 2 s later
+    { static int mode = -1; static int64_t sp, st; if (mode < 0) { const char *e = getenv("DM_ADPF_TARGET"); mode = !(e && !strcmp(e, "game")); }
+      if (mode) { if (!sp || p <= sp || t - st > 2000000000ll) { sp = p; st = t; } p = sp; } }
     hint_init(p);
     { static unsigned n; if (++n % 60 == 0) gpu_turbo(); }
     if (g_work_start) {   // (a longer span: the game was held, by the pause menu or the background)
@@ -271,8 +323,14 @@ void dm_perf_frame(double period) {
     }
     g_prev_present = t;
     static unsigned frames; if (frames++ % 300 == 0) hint_threads_scan((int32_t)gettid());
+    // the GPU's clock every 30 presents, its range and mean logged every 600 with the hint's state (KGSL's sysfs, where the app may read it: gpu_mhz)
+    { static int lo, hi, nmhz; static int64_t sum; int m = frames % 30 == 0 ? gpu_mhz() : -1;
+      if (m > 0) { if (!nmhz || m < lo) lo = m; if (m > hi) hi = m; sum += m; nmhz++; }
+      if (frames % 600 == 0) { if (g_hint || nmhz) LOG("[perf] ADPF: target %.2f ms (%u changes), %u load increases (%u with the GPU's)%s; GPU clock %d-%d MHz, mean %d (%d readings)", g_hint_target / 1e6, g_hint_updates,
+                                   g_hint_inc[0], g_hint_inc[1], g_hint ? "" : " (no session)", nmhz ? lo : -1, nmhz ? hi : -1, nmhz ? (int)(sum / nmhz) : -1, nmhz);
+                                lo = hi = nmhz = 0; sum = 0; } }
     if (!g_hint) return;
-    if (p != g_hint_target && H.update) { H.update(g_hint, p); g_hint_target = p; }
+    if (p != g_hint_target && H.update) { H.update(g_hint, p); g_hint_target = p; g_hint_updates++; }
 }
 
 // The window's frame rate: the game's rate, so the display can pick a mode it divides (60 / 120 Hz rather than 144 Hz for a 60 fps game).
