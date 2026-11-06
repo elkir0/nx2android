@@ -91,6 +91,13 @@ WIDE_WORDS = (os.environ.get('DM_SHADER_WIDE_WORDS') or '0') != '0'
 # A and B, its sums in half precision as the console's f16 accumulator allows (CodeGen/Spirv TensorF16; the device needs shaderFloat16). The default 0 keeps the float sum, the same
 # results as before: the half sum is not bit-exact, and no run has shown the game engaging the network on the phone yet (gfx_vk_shader.c says it when one of them loads)
 HMMA_F16 = (os.environ.get('DM_SHADER_HMMA_F16') or '0') != '0'
+# A vertex shader's base vertex, base instance and draw index (c0 + 0x640, 0x644, 0x648, which NVN's driver writes for every draw) from Vulkan's BaseVertex, BaseInstance and
+# DrawIndex (Program.cs QueryHasConstantBufferDrawParameters). The replay can put a direct draw's base instance in c0 (gfx_vk_exec.c g_draw_binst) but not an indirect draw's,
+# whose record the GPU writes: it put 0, so Mario Kart World's GPU-culled vegetation (DrawElementsIndirect records whose first instance the culling writes: 15, 23...) read its
+# instances from the start of the list, whose order the culling's atomics change from frame to frame: at its first race's start line, trees drawn black came and went in 25-50 %
+# of the frames, 1-2 % with this, and most Free Roam places are steady (Galaxy Z Fold, 2026-11-06; some trees there still flicker, from another cause).
+# DM_SHADER_DRAW_PARAMS=0: from c0, as before
+DRAW_PARAMS = (os.environ.get('DM_SHADER_DRAW_PARAMS') or '1') != '0'
 
 def records(d):
     r = [m.start() for m in re.finditer(b'BTCDBTCD', d)]
@@ -158,7 +165,8 @@ def xfb_layout(key, ctl):
 def base_job(key, stage, cp, c1):   # the fields every Android job has (Program.cs reads each of them; a job without one gets the Apple chain's answer)
     return {'key': key, 'stage': stage, 'code': cp, 'tex': {}, 'img': {}, 'attr': {}, 'fout': {}, 'c1': c1.hex(), 'debug': False, 'reduced': True, 'sb_align': SB_ALIGN, 'subgroup': SUBGROUP,
             'gather_bias': GATHER_BIAS, 'gs_passthrough': False, 'metal_image_atomics': False, 'handle_arrays': HANDLE_ARRAYS, 'shared_max': SHARED_MAX, 'spill_slices': SPILL_SLICES,
-            'spill_keep': SPILL_KEEP, 'raw_gmem': RAW_GMEM, 'nan_minmax': NAN_MINMAX, 'wide_words': WIDE_WORDS, 'hmma_f16': HMMA_F16}
+            'spill_keep': SPILL_KEEP, 'raw_gmem': RAW_GMEM, 'nan_minmax': NAN_MINMAX, 'wide_words': WIDE_WORDS, 'hmma_f16': HMMA_F16,
+            'draw_params': DRAW_PARAMS}
 
 # ---- NVN2 (Switch 2): Ampere code, translated by the translator's Ampere frontend (job arch sm86), as dmsh_build.py job_for and dmsh_ampere.py read it ----
 def nvn2(ctl):   # an NVN2 control section: magic, version 0xc9 (NVN's have version 1 and are 0x880 bytes)

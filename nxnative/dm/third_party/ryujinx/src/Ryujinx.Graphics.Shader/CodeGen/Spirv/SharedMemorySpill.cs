@@ -22,6 +22,11 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
         // Instead of DeclareMemories for the workgroup storage class: each shared memory's first word in the slice, the variable for the slice's first word, NumWorkgroups
         public static void Declare(CodeGenContext context)
         {
+            // The workgroup's invocations write the slice and read each other's words across the barriers. Under the GLSL450 memory model a buffer that is not Coherent
+            // gives no such visibility, barriers or not: a device may serve its reads from a per-core cache the other invocations' writes never reach. Workgroup memory
+            // is coherent by nature, so the buffer standing in for it is declared so (DeclareStorageBuffers has made its variable by now)
+            context.Decorate(context.StorageBuffers[context.Properties.SharedMemorySpillBinding], Decoration.Coherent);
+
             int offset = 0;
 
             foreach ((int id, MemoryDefinition memory) in context.Properties.SharedMemories)

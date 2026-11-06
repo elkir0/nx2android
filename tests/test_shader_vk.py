@@ -85,6 +85,15 @@ class Nvn2Jobs(unittest.TestCase):
         j = SV['base_job']('k', 'ps', 'x.bin', b'')
         self.assertEqual((j['sb_align'], j['subgroup'], j['gather_bias'], j['gs_passthrough']), (256, 128, 8, False))
 
+    def test_draw_parameters_from_vulkan(self):   # shader_vk.py DRAW_PARAMS: c0's base vertex / instance / draw index from Vulkan's built-ins, which an indirect draw's record sets
+        if os.environ.get('DM_SHADER_DRAW_PARAMS') != '0':
+            self.assertIs(SV['base_job']('k', 'vs', 'x.bin', b'')['draw_params'], True)
+        cs = (REPO / 'nxnative/dm/gfx/tools/dmsh_xlate/Program.cs').read_text(encoding='utf-8')
+        self.assertIn('public bool QueryHasConstantBufferDrawParameters() => _job["draw_params"] is JsonNode n && (bool)n;', cs)   # Metal's jobs have none: false, as before
+        rp = (REPO / 'nxnative/dm/third_party/ryujinx/src/Ryujinx.Graphics.Shader/Translation/Transforms/DrawParametersReplace.cs').read_text(encoding='utf-8')
+        self.assertIn('case Constants.NvnBaseInstanceByteOffset / 4:', rp)
+        self.assertIn('0x644', (REPO / 'nxnative/dm/gfx/nvn/dmsh_abi.h').read_text(encoding='utf-8').split('DMSH_C0_BASE_INSTANCE', 1)[1][:12])   # the offset the replay writes is the one replaced
+
 
 class Reflection(unittest.TestCase):
     def classify(self, stage, name, res=None, **b):
@@ -331,6 +340,7 @@ class Translator(unittest.TestCase):
     def test_48_kb_of_shared_memory_go_to_a_buffer(self):
         dis, res = self.translate(amov(3, 7) + asts(0x10, 3) + ainst(*AMPERE_EXIT), nvn2_cs=[0, 0, 0, 0x10, 0], local=[64, 1, 1], shared=0xc000)
         self.assertIn('"shared_spill"', dis); self.assertIn('BuiltIn NumWorkgroups', dis); self.assertNotIn(' Workgroup ', dis)
+        self.assertIn('OpDecorate %shared_spill Coherent', dis)   # (SharedMemorySpill.Declare: the invocations see each other's words, as in workgroup memory)
         self.assertEqual((res['spill_words'], res['spill_slices']), (0x3000, 512))
 
     def test_48_kb_split_keeps_its_first_32_in_workgroup_memory(self):   # SharedMemorySpill.Split (job spill_keep, shader_vk.py SPILL_KEEP)

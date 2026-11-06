@@ -56,6 +56,30 @@ def app_stem(g, name):   # the file name of the APK and the data pack: the profi
     return ipa[:-4] if ipa.endswith('.ipa') else ipa
 
 
+# The environment switches shader_vk.py reads that change the bundle (its SPILL_KEEP, NAN_MINMAX, SPIRV_OPT, WIDE_WORDS, HMMA_F16, DRAW_PARAMS), each to the value the script makes
+# of it, None for its default: SPILL_KEEP is int(value or 0), DRAW_PARAMS is off only for '0', the others are on for anything but unset, '' and '0'. The translator (dm/gfx/tools/dmsh_xlate over dm/third_party/ryujinx) reads
+# none that changes its output (DMSH_STACK, DMSH_BINDLESS_TRACE only add to its error output); DM_VK_VT is the key's vt part (shader_vt)
+def _switch_on(v): return '1' if (v or '0') != '0' else None
+def _switch_off(v): return '0' if (v or '1') == '0' else None   # (a switch on by default)
+def _switch_int(v):
+    try: n = int(v or 0)
+    except ValueError: return v   # shader_vk.py stops on it, under a key of its own
+    return str(n) if n else None
+SHADER_SWITCHES = {'DM_SHADER_DRAW_PARAMS': _switch_off, 'DM_SHADER_HMMA_F16': _switch_on, 'DM_SHADER_NAN_MINMAX': _switch_on, 'DM_SHADER_SPILL_KEEP': _switch_int, 'DM_SHADER_SPIRV_OPT': _switch_on,
+                   'DM_SHADER_WIDE_WORDS': _switch_on}
+
+
+def shader_switches(env):   # the bundle's switches set in env as one stable text, 'NAME=value ...' sorted, those at their default left out ('' when none is)
+    return ' '.join(f'{k}={v}' for k, f in sorted(SHADER_SWITCHES.items()) if (v := f(env.get(k))) is not None)
+
+
+def shader_vt(env, ap):
+    """Shader-side virtual texturing for the bundle (shader_vk.py --vt): the profile turns it on for the app (env DM_VK_VT=<v>; its last row, which the app's env.txt keeps:
+    front_android.c env_file), or the tools' environment has DM_VK_VT; v neither empty nor 0, as shader_vk.py takes it"""
+    rows = [v for k, _, v in (e.partition('=') for e in ap.env) if k == 'DM_VK_VT']
+    return bool(_switch_on(rows[-1] if rows else None) or _switch_on(env.get('DM_VK_VT')))
+
+
 # --touch: the pause menu's first-launch defaults for a game played by touch. The gamepad's controls take every touch that goes down on them or near them (front_android.c ctl_at,
 # overlay_layout.h ov_reach: about a quarter of a tablet's screen, at its sides); hidden, only the menu button does and every other touch is the game's, in both modes (hle_hid.c
 # touch_on). As Unpacking's profile (setting overlay=0); the pause menu's Gamepad item shows it again, and a controller works either way
@@ -582,15 +606,17 @@ class Port:
         PROG.stage('Vulkan shaders', step='building the translator')
         xlate, xkey = self.translator()
         PROG.set(step='checking the inputs')
+        # the profile's env rows reach only the app (env.txt), and android.tsv is no shader input (upstream.py): its DM_VK_VT goes to shader_vk.py as --vt
+        vt = shader_vt(self.env, self.ap)
         key = nsp.fingerprint(nsp.package_key(pkg), ('files', [DM / 'android/tools/shader_vk.py'] + nsp.tool_files(NXNATIVE)), ('files', nsp.profile_files(self.g)), xkey,
-                              ('files', sorted(cap.glob('*.bin'))))
+                              ('files', sorted(cap.glob('*.bin'))), shader_switches(self.env), f'vt={int(vt)}')   # the switches as shader_vk.py runs with them (env=self.env)
         if self.dmsv.is_file() and (note := nsp.reused(kf, key)) is not None:
             PROG.end(f'{note}, reused (inputs unchanged)'); return
         tmp = self.dmsv.with_name('shaders.dmsv.partial'); nsp.rmtree(tmp); nsp.rmtree(kf)
         def line(s):
             if m := re.match(r'translating (\d+) shaders', s): PROG.set(step=f'translating {int(m.group(1)):,} shaders')
-        nsp.run([PY, DM / 'android/tools/shader_vk.py', pkg, tmp, '--jobs', str(self.o.jobs), '--dotnet', self.tools['dotnet'], '--xlate', xlate, '--capture', cap],
-                self.logs / 'android_shaders.log', env=self.env, on_line=line)
+        nsp.run([PY, DM / 'android/tools/shader_vk.py', pkg, tmp, '--jobs', str(self.o.jobs), '--dotnet', self.tools['dotnet'], '--xlate', xlate, '--capture', cap]
+                + (['--vt'] if vt else []), self.logs / 'android_shaders.log', env=self.env, on_line=line)
         m = re.search(r'^(\d+) of (\d+) shaders', (self.logs / 'android_shaders.log').read_text(errors='replace'), re.M)
         if not m or m.group(1) == '0': raise BuildError(f'no shader translated (see {self.logs / "android_shaders.log"})')
         note = f'{int(m.group(1)):,} of {int(m.group(2)):,} shaders, {tmp.stat().st_size / 2**20:,.0f} MB'

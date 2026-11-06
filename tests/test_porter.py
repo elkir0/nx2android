@@ -1,6 +1,7 @@
 # Unit tests of the port pipeline's own parts (python -m unittest discover tests). They need no game files, toolchains or device.
-import hashlib, importlib.util, json, os, random, re, shutil, struct, sys, tempfile, unittest
+import contextlib, hashlib, importlib.util, io, json, os, random, re, shutil, struct, sys, tempfile, unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
@@ -753,6 +754,61 @@ class Saves(unittest.TestCase):   # porter/saves.py: the save folders on the dev
         u = Path(tempfile.mkdtemp(dir=t)); self.assertEqual(sorted(p.name for p in saves._unpacked(t / 'loose.zip', u).iterdir()), ['main.dat', 'other.dat'])
         with self.assertRaises(BuildError): saves._unpacked(t / 'bad.zip', Path(tempfile.mkdtemp(dir=t)))
         self.assertEqual(saves._unpacked(t, None), t)   # a folder: as it is
+
+
+class ShaderBundleKey(unittest.TestCase):   # Port.shaders: the bundle's reuse key covers shader_vk.py's switches, and a profile's env DM_VK_VT builds it with --vt (split and shader_vk.py faked)
+    def setUp(self): self.environ = dict(os.environ)
+    def tearDown(self): os.environ.clear(); os.environ.update(self.environ)
+
+    def port(self, rows, env=None):   # a Port at its shader stage, for a throwaway profile with these android.tsv rows, the tools' environment env
+        d = profile_dir([('status', 'playable')] + rows); t = Path(tempfile.mkdtemp(prefix='nx2a_test_build_'))
+        self.addCleanup(shutil.rmtree, d.parent, True); self.addCleanup(shutil.rmtree, t, True)
+        p = pipeline.Port(pipeline.Options(folder=t, jobs=1)); g = game.load(d.name)
+        p.g, p.ap, p.env, p.work, p.aw, p.logs, p.tools = g, android_profile.AndroidProfile(g), dict(env or {}), t, t / 'android', t / 'logs', {'dotnet': Path('dotnet')}
+        p.versions, p.dirs, p.derived, p.provisional, p.oodle_why, p.aoc = [], {}, '', False, '', None
+        p.translator = lambda: (t / 'dmsh_xlate.dll', 'translator key'); p.aw.mkdir()
+        return p
+
+    def shaders(self, p):   # p.shaders() → (shader_vk.py's command line, None when the bundle was reused; the key it is kept under)
+        cmds = []
+        def run(cmd, log, env=None, **kw):   # shader_vk.py: one shader into the bundle (cmd[3], its .partial)
+            cmds.append([str(c) for c in cmd]); Path(cmd[3]).write_bytes(b'DMSV'); log.parent.mkdir(parents=True, exist_ok=True); log.write_text('1 of 1 shaders\n')
+        with mock.patch.object(pipeline.nsp, 'split_shaders', lambda *a, **kw: None), mock.patch.object(pipeline.nsp, 'run', run), contextlib.redirect_stdout(io.StringIO()):
+            p.shaders()   # (its stage lines kept off the test output)
+        return (cmds[0] if cmds else None), (p.aw / 'shaders.dmsv.key').read_text().split('\n')[0]
+
+    def test_switches(self):   # DM_SHADER_WIDE_WORDS=1 builds the bundle again under another key; unset and 0 are the same bundle (shader_vk.py: (value or '0') != '0'), reused
+        p = self.port([])
+        cmd, k0 = self.shaders(p); self.assertIsNotNone(cmd)
+        p.env['DM_SHADER_WIDE_WORDS'] = '0'
+        cmd, k = self.shaders(p); self.assertIsNone(cmd); self.assertEqual(k, k0)
+        p.env['DM_SHADER_WIDE_WORDS'] = '1'
+        cmd, k1 = self.shaders(p); self.assertIsNotNone(cmd); self.assertNotEqual(k1, k0)
+        cmd, k = self.shaders(p); self.assertIsNone(cmd); self.assertEqual(k, k1)   # and that bundle is kept while the switch stays
+        # one sorted text of the values shader_vk.py makes of them: SPILL_KEEP int(value or 0), a flag on for anything but '' and '0'; DM_VK_VT and other variables left out
+        self.assertEqual(pipeline.shader_switches({'DM_SHADER_WIDE_WORDS': 'yes', 'DM_SHADER_HMMA_F16': '', 'DM_SHADER_SPILL_KEEP': '32768', 'DM_SHADER_NAN_MINMAX': '0',
+                                                   'DM_VK_VT': '1', 'PATH': '/bin'}), 'DM_SHADER_SPILL_KEEP=32768 DM_SHADER_WIDE_WORDS=1')
+        self.assertEqual(pipeline.shader_switches({'DM_SHADER_SPILL_KEEP': '0', 'DM_SHADER_SPIRV_OPT': '0'}), '')
+        # DRAW_PARAMS is on by default: unset, '' and '1' are the default bundle, only '0' another
+        self.assertEqual(pipeline.shader_switches({'DM_SHADER_DRAW_PARAMS': '1'}), '')
+        self.assertEqual(pipeline.shader_switches({'DM_SHADER_DRAW_PARAMS': ''}), '')
+        self.assertEqual(pipeline.shader_switches({'DM_SHADER_DRAW_PARAMS': '0'}), 'DM_SHADER_DRAW_PARAMS=0')
+
+    def test_switches_are_shader_vks(self):   # the key's switches are every DM_SHADER_ variable shader_vk.py and the translator's scripts read (a new one fails here until it is in the key)
+        src = [REPO / 'nxnative/dm/android/tools/shader_vk.py', *sorted((REPO / 'nxnative/dm/gfx/tools').glob('*.py'))]
+        read = {n for f in src for n in re.findall(r"""(?:environ(?:\.get\(|\[)|getenv\()\s*['"](DM_SHADER_\w+)""", f.read_text(encoding='utf-8'))}
+        self.assertEqual(read, set(pipeline.SHADER_SWITCHES))
+
+    def test_profile_vt(self):   # a profile's env DM_VK_VT=1: the bundle built with --vt, under another key than the same profile's without it (vt=1 / vt=0)
+        cmd, k_off = self.shaders(self.port([])); self.assertNotIn('--vt', cmd)
+        cmd, k_on = self.shaders(self.port([('env', 'DM_VK_VT=1')])); self.assertIn('--vt', cmd); self.assertNotEqual(k_on, k_off)
+        self.assertEqual(self.shaders(self.port([('env', 'DM_VK_VT=2')]))[1], k_on)   # any value but '' and 0: shader_vk.py has only --vt
+        cmd, k = self.shaders(self.port([], env={'DM_VK_VT': '1'})); self.assertIn('--vt', cmd); self.assertEqual(k, k_on)   # the tools' own DM_VK_VT, as shader_vk.py's default
+
+    def test_profile_without_vt(self):   # no env DM_VK_VT row, another env row, DM_VK_VT=0 or empty, or a last row of 0 (the app's env.txt keeps the last): no --vt, the key of none
+        cmd, k_off = self.shaders(self.port([])); self.assertNotIn('--vt', cmd)
+        for rows in ([('env', 'DM_VK_MT_REPLAY=1')], [('env', 'DM_VK_VT=0')], [('env', 'DM_VK_VT=')], [('env', 'DM_VK_VT=1'), ('env', 'DM_VK_VT=0')]):
+            cmd, k = self.shaders(self.port(rows, env={'DM_VK_VT': '0'})); self.assertNotIn('--vt', cmd, rows); self.assertEqual(k, k_off, rows)
 
 
 if __name__ == '__main__':

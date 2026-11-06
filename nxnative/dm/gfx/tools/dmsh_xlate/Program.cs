@@ -178,6 +178,10 @@ static class SwshXlate
         public bool QueryHasUnalignedStorageBuffer() => _job["sb_align"] != null;
         // Job "subgroup" (the Android chain, shader_vk.py SUBGROUP): the host's subgroup size; above 32 the translator emulates Maxwell's 32-lane warps inside it. Metal's SIMD groups are 32
         public int QueryHostSubgroupSize() => _job["subgroup"] is JsonNode n ? (int)n : 32;
+        // Job "draw_params" (the Android chain, shader_vk.py DRAW_PARAMS): a vertex shader's reads of the draw's base vertex, base instance and draw index in c0 (+ 0x640, 0x644, 0x648,
+        // which NVN's driver writes for every draw) take Vulkan's BaseVertex, BaseInstance and DrawIndex instead (Transforms/DrawParametersReplace), which the device sets from an indirect
+        // draw's record too, where the host can only put 0 in c0. Metal's chain leaves them in c0 (no job field: false)
+        public bool QueryHasConstantBufferDrawParameters() => _job["draw_params"] is JsonNode n && (bool)n;
         // Job "gather_bias" (the Android chain, shader_vk.py GATHER_BIAS): bits of the host's gather coordinate precision; the translator then moves gather coordinates by
         // 1 / (size x 2^(bits + 1)) texels, off the texel edge where hosts round differently from Maxwell. 0 (Metal): none
         public int QueryHostGatherBiasPrecision() => _job["gather_bias"] is JsonNode n ? (int)n : 0;
