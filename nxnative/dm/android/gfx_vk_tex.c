@@ -956,6 +956,9 @@ static void img_big_said(const vkimg_t *im, const tex_t *t, const vkfmt_t *f, in
           own ? "memory of its own:" : "in a large block:", here / 1048576.0, n);
 }
 void vk_tex_prepare(VkCommandBuffer cb, vkimg_t *im) {
+    // (img_upgrade) a main command buffer's use, an attachment's above all: begin_pass prepares every attachment it binds, already in GENERAL or not, and renders into it; no other
+    // call marks attachments as written (vk_img_wrote: storage images, copies, clears). Marked before the GENERAL return, or an upgrade later in the submission copies the image without them
+    if (vk_sub_open() && cb == vk_cmd()) im->msub = vk_sub_serial() + 1;
     if (im->layout == VK_IMAGE_LAYOUT_GENERAL) return;
     VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, 0, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, im->img, {im->aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS}};
@@ -1052,7 +1055,7 @@ static void vk_tex_view_drop_all(vkimg_t *im);
 // copy and clear destinations): with attachments alone, an image a compute shader writes read as older than a render target drawn over the same memory, and Mario Kart World's
 // run 13 spent the 200 lines on such pairs (a 52x29 R8UI image beside 32x32 R8 and 13x7 RGBA16F targets of its transient memory) before anything else could be seen
 static uint64_t g_wseq;
-void vk_img_wrote(vkimg_t *im) { im->wseq = ++g_wseq; im->gpu_w = 1; if (im->sp) vk_sparse_gpu_wrote(im); }   // the GPU writes im (gfx_vk_exec.c: storage images, copies, clears)
+void vk_img_wrote(vkimg_t *im) { im->wseq = ++g_wseq; im->gpu_w = 1; if (vk_sub_open()) im->msub = vk_sub_serial() + 1; if (im->sp) vk_sparse_gpu_wrote(im); }   // the GPU writes im (gfx_vk_exec.c: storage images, copies, clears)
 static void alias_link(vkimg_t *im) {
     for (uint32_t i = 0; i < g_by_key.cap; i++) {
         vkimg_t *o = g_by_key.vals[i]; if (!o || o == im || o->pool != im->pool || o->off >= im->off + im->size || im->off >= o->off + o->size) continue;
@@ -1091,6 +1094,94 @@ static void evict_overlaps(uint64_t pool, int64_t off, int64_t size) {
     }
     for (int j = 0; j < n; j++) { vkimg_t *o = nvn_hm_get(&g_by_key, &ks[j]); if (!o) continue; nvn_hm_del(&g_by_key, &ks[j]); img_drop(o); g_img_evicted++; }
 }
+// ---- image sharing: the decision (tests: tests/test_vk_image_share.py) ----
+// Two NVN textures over the same storage that differ only by IMAGE are the same texels on the Switch: a compute shader writes through the IMAGE one, draws sample the other. Mario Kart
+// World made two images of such pairs (a 398x398 ASTC 5x5 texture at +468434432, its [RED] line below). With DM_VK_IMAGE_SHARE a colour texture's image key leaves IMAGE out (vk_tex_),
+// and a texture that needs storage use (IMAGE, or registered as an image: img_use) and finds an image made without it: uses it when it has storage use already or the texture needs none;
+// uses it as well when its format takes no storage images (Mario Kart World's ASTC: an image of its own would have none either); has it made again with storage use (an upgrade,
+// img_upgrade) when nothing keeps it from one (share_excl); else gets an image of its own, as before
+enum { SHARE_REUSE, SHARE_UPGRADE, SHARE_SEPARATE };
+static int img_share_decide(VkImageUsageFlags have, int need_storage, int fmt_storage_ok, int excluded) {
+    if (!need_storage || (have & VK_IMAGE_USAGE_STORAGE_BIT) || !fmt_storage_ok) return SHARE_REUSE;   // (no storage format: an image of its own would have no storage use either)
+    return excluded ? SHARE_SEPARATE : SHARE_UPGRADE;
+}
+// What keeps an image from an upgrade (share_excl, share_found), named in the [RED] line of the image made beside it
+enum { SHX_SPARSE = 1, SHX_DENSE = 2, SHX_PACKAGED = 4, SHX_TWIN = 8, SHX_LINEAR = 16, SHX_MSAA = 32, SHX_BUSY = 64, SHX_FORMAT = 128, SHX_FAILED = 256 };
+static const char *const SHX_TEXT[] = {"sparse", "dense", "packaged (CPU content)", "an sRGB / linear twin's image", "linear", "multisampled",
+                                       "written in this submission already (a copy before its command buffers would miss it)", "its format takes no storage images", "the upgrade failed"};
+static void shx_text(unsigned x, char *out, size_t n) {   // the reasons in x, comma-separated ("" for none)
+    size_t o = 0; if (!n) return; out[0] = 0;
+    for (unsigned i = 0; i < sizeof SHX_TEXT / sizeof *SHX_TEXT && o + 1 < n; i++) if (x >> i & 1) {
+        int w = snprintf(out + o, n - o, "%s%s", o ? ", " : "", SHX_TEXT[i]); if (w < 0) break; o += (size_t)w < n - o ? (size_t)w : n - o - 1; }
+}
+// DM_VK_IMAGE_SHARE (start-up, default 1): the sharing above; 0: IMAGE stays in a colour texture's image key, so such a pair is two images, as before
+static int share_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_IMAGE_SHARE"); v = !(e && !atoi(e)); } return v; }
+// ---- end of the image sharing decision ----
+static unsigned share_excl(const vkimg_t *o, const tex_t *t, const vkfmt_t *f, int twin) {   // what keeps o from an upgrade for t (SHX_*); g_img_mu held
+    unsigned x = 0;
+    if (o->sp || o->promo) x |= SHX_SPARSE;   // (a sparse pool's texture keeps IMAGE in its key: never met here)
+    if (o->dn || o->lv0) x |= SHX_DENSE;
+    if (o->packaged || o->pkg_mem || f->dec || packaged_tex(t)) x |= SHX_PACKAGED;   // filled from guest memory by the CPU (uploads, write protection, re-uploads), or t would be
+    if (twin) x |= SHX_TWIN;   // made by a texture of the other format of an sRGB / linear pair (vk_tex_'s twin views): its format and format list are that texture's
+    if ((o->flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) || o->lin_mem || o->lin_gen) x |= SHX_LINEAR;   // its storage copied in or back (lin_copy, lin_back)
+    if (o->samples > 1) x |= SHX_MSAA;
+    if (vk_sub_open() && o->msub == vk_sub_serial() + 1) x |= SHX_BUSY;   // (img_upgrade)
+    return x;
+}
+// An upgrade (nvn_mtl.m tex_upgrade): im made again as it was created plus storage use, in memory from vk_image_memory as img_new's, its levels and layers copied in, the new image swapped
+// into the same vkimg_t (every holder keeps its pointer: the image table, alias links, twins, the pass code's), its views dropped (vk_tex_view_drop_all: the views by ID, the descriptor sets
+// memoized or kept across submissions make theirs again) and the old image freed once the GPU is past this submission, as dense_remake. The copy goes into the upload command buffer, which
+// runs after the parts of this submission already sent and before the main command buffer being recorded: the lookup may come from a draw's descriptors, with a render pass open
+// (gfx_vk_exec.c prepare_draw) where no copy may be recorded, and this file cannot tell. So the copy holds every write up to this submission and none of its main command buffers': an image
+// one of them wrote (an attachment, a storage image, a copy or clear destination) or took out of UNDEFINED (vkimg_t msub) is not upgraded (SHX_BUSY), and the texture gets an image of its own.
+// The image counters (g_img_n, g_img_bytes: its NVN storage) do not change; vk_image_memory counts its memory. The replay thread in a submission, g_img_mu held. 1: upgraded
+// (tests: tests/test_vk_image_share.py, its Vulkan calls stubbed)
+static uint64_t g_img_upgrades;
+static int img_upgrade(vkimg_t *im, const tex_t *t) {
+    VkFormat fl[2] = {im->fmt, im->fmt2}; VkImageFormatListCreateInfo fli = {VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO, NULL, im->fmt2 ? 2u : 1u, fl};   // (img_new's list: fixed_fmt)
+    VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, im->fixed_fmt ? &fli : NULL, im->cflags, im->target == 2 ? VK_IMAGE_TYPE_3D : im->target == 0 || im->target == 3 ? VK_IMAGE_TYPE_1D : VK_IMAGE_TYPE_2D,
+        im->fmt, {im->w, im->h, im->d}, im->levels, im->layers, (VkSampleCountFlagBits)im->samples, VK_IMAGE_TILING_OPTIMAL, im->usage | VK_IMAGE_USAGE_STORAGE_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL,
+        VK_IMAGE_LAYOUT_UNDEFINED};
+    VkImage img; VkResult r = vkCreateImage(V.dev, &ci, NULL, &img);
+    if (r) { VKRED_ONCE(183, "image upgrade: vkCreateImage refused %ux%ux%u format %d usage %#x flags %#x (%d): the texture with IMAGE gets an image of its own", im->w, im->h, im->d, im->fmt, ci.usage, ci.flags, r); return 0; }
+    VkMemoryRequirements req; vkGetImageMemoryRequirements(V.dev, img, &req); VkDeviceSize moff; void *sub;
+    VkDeviceMemory mem = vk_image_memory(&req, vk_mem_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT), &moff, &sub);
+    if (!mem) { VKRED_ONCE(184, "image upgrade: memory allocation failed (%llu bytes): the texture with IMAGE gets an image of its own", (unsigned long long)req.size); vkDestroyImage(V.dev, img, NULL); return 0; }
+    VKCHK(vkBindImageMemory(V.dev, img, mem, moff));
+    VkCommandBuffer cb = vk_upload_cmd();
+    vk_img_barrier_all(cb);   // after every earlier access of the old image (earlier submissions, this one's parts sent, this upload buffer's uploads)
+    VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, 0, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, img, {im->aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS}};
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &b);   // the new one into GENERAL (vk_tex_prepare's)
+    int copy = im->layout == VK_IMAGE_LAYOUT_GENERAL;   // (still UNDEFINED: nothing was ever in it)
+    for (uint32_t l = 0; copy && l < im->levels; l++) {   // each level with all its layers (a 3D image's slices: its extent's depth)
+        VkImageCopy c = {{im->aspect, l, 0, im->layers}, {0, 0, 0}, {im->aspect, l, 0, im->layers}, {0, 0, 0}, {im->w >> l ? im->w >> l : 1, im->h >> l ? im->h >> l : 1, im->d >> l ? im->d >> l : 1}};
+        vkCmdCopyImage(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, img, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+    }
+    vk_img_barrier_all(cb);   // before what this upload buffer records into the new image later (its end has one before the main command buffers)
+    vk_tex_view_drop_all(im);
+    if (im->sub) vk_defer_free_image_sub(im->img, im->sub); else vk_defer_free_image(im->img, im->mem);
+    im->img = img; im->mem = mem; im->sub = sub; im->usage = ci.usage; im->layout = VK_IMAGE_LAYOUT_GENERAL;
+    uint64_t n = ++g_img_upgrades;
+    if (n <= 8) VKLOG("texture %ux%ux%u nvn format %#x (vk %d, %u levels, %u layers) at %+lld: its image made again with storage use for a texture with IMAGE over the same storage, %s (upgrade %llu)",
+        im->w, im->h, im->d, t->d.format, im->fmt, im->levels, im->layers, (long long)t->off, copy ? "its content copied" : "nothing in it yet", (unsigned long long)n);
+    else if (n % 64 == 0) VKLOG("image upgrades (storage use for a texture with IMAGE over another's storage): %llu so far", (unsigned long long)n);
+    return 1;
+}
+// The image a texture of the shared key found (twin: through its sRGB / linear twin's key): o itself, upgraded where it needs storage use (need) and o lacks it, or NULL when the texture
+// gets an image of its own (*why: the SHX_ reasons). g_img_mu held
+static vkimg_t *share_found(vkimg_t *o, const tex_t *t, const vkfmt_t *f, int need, int twin, unsigned *why) {
+    *why = 0; need = need && !(o->flags & NVN_TEXTURE_FLAGS_IMAGE);   // (made for a texture with IMAGE: it has what its format allows, an image of the texture's own would have no more)
+    int fok = 1; unsigned x = 0;
+    if (need && !(o->usage & VK_IMAGE_USAGE_STORAGE_BIT)) { VkFormatProperties fp; vkGetPhysicalDeviceFormatProperties(V.pd, o->fmt, &fp);   // (img_new's test for storage use)
+        fok = (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0; x = share_excl(o, t, f, twin); }
+    switch (img_share_decide(o->usage, need, fok, x != 0)) {
+    case SHARE_REUSE: return o;
+    case SHARE_UPGRADE: if (!vk_sub_open() || img_upgrade(o, t)) return o;   // (outside a submission nothing binds it as a storage image: upgraded at its next lookup in one)
+        *why = SHX_FAILED; return NULL;
+    default: *why = x | (fok ? 0 : SHX_FORMAT); return NULL;
+    }
+}
 static vkimg_t *vk_tex_(const tex_t *t);
 // A texture of a virtual pool that is not sparse (Android: an aliased pool, whose own range has no CPU alias, hle_nvn.c nvn_virt_xlat): its storage at the physical memory behind it, the
 // texture otherwise as it is (its image key is its pool and offset). One whose range cannot be had in one piece has no storage the replay may read: it starts cleared, [RED] once. A sparse
@@ -1122,31 +1213,43 @@ static vkimg_t *vk_tex_(const tex_t *t) {
     akey k; memset(&k, 0, sizeof k); k.pool = (uint64_t)(uintptr_t)t->pool; k.off = t->off; k.d = t->d;
     // flags that do not change the storage's layout are not part of the key: on the Switch two textures over the same memory that differ only in them see the
     // same texels. Xenoblade Chronicles 3 renders its shadow maps and depth-stencil buffer through textures with COMPRESSIBLE and samples them through others with
-    // IMAGE added; as separate images those were never written, the shadows were total and the stencil's material tags 0, and its lit scene black. IMAGE stays
-    // in the key for colour formats (it gives the image storage usage), not for depth and stencil, which cannot be storage images
-    k.d.flags &= NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_SPARSE | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET | NVN_TEXTURE_FLAGS_MINIMAL_LAYOUT | (f->depth || f->stencil ? 0 : NVN_TEXTURE_FLAGS_IMAGE);
-    // registered as an image (TexturePoolRegisterImage, mtl_reg_image) though its builder omitted IMAGE: made with storage use, as the image it is bound as (nvn_mtl.m RegisterImage)
-    tex_t ti; const tex_t *tc = t;
-    if (!(t->d.flags & NVN_TEXTURE_FLAGS_IMAGE) && !(f->depth || f->stencil) && img_use(t->serial)) { ti = *t; ti.d.flags |= NVN_TEXTURE_FLAGS_IMAGE; tc = &ti; k.d.flags |= NVN_TEXTURE_FLAGS_IMAGE; }
+    // IMAGE added; as separate images those were never written, the shadows were total and the stencil's material tags 0, and its lit scene black. Colour formats leave
+    // IMAGE out too (DM_VK_IMAGE_SHARE, default on; a sparse pool's texture keeps it: its sparse and dense images stay as they were): a texture that needs storage use and finds
+    // an image made without it has it made again with that use (img_share_decide, img_upgrade), or, where that cannot be done, gets an image of its own under the key with IMAGE,
+    // as before. With DM_VK_IMAGE_SHARE=0 IMAGE stays in a colour texture's key (the pair is two images). Depth and stencil cannot be storage images: never in their key
+    int colour = !(f->depth || f->stencil);
     // A sparse pool's texture (hle_nvn.c struct vpool): sampled ones hold what the game mapped into the pool and are read from it (nvn_mtl.m tex_from_storage), render targets and images
     // are the GPU's; either is a sparse-resident image when it qualifies (sparse_make), else made whole under a budget (sp_whole_ok)
     int sp_pool = t->pool && t->mem && nvn_sparse_pool(t->pool);
+    int share = colour && t->pool && !sp_pool && share_on();
+    k.d.flags &= NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_SPARSE | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET | NVN_TEXTURE_FLAGS_MINIMAL_LAYOUT | (colour && !share ? NVN_TEXTURE_FLAGS_IMAGE : 0);
+    // registered as an image (TexturePoolRegisterImage, mtl_reg_image) though its builder omitted IMAGE: made with storage use, as the image it is bound as (nvn_mtl.m RegisterImage)
+    tex_t ti; const tex_t *tc = t;
+    if (!(t->d.flags & NVN_TEXTURE_FLAGS_IMAGE) && colour && img_use(t->serial)) { ti = *t; ti.d.flags |= NVN_TEXTURE_FLAGS_IMAGE; tc = &ti; if (!share) k.d.flags |= NVN_TEXTURE_FLAGS_IMAGE; }
+    int need = share && (tc->d.flags & NVN_TEXTURE_FLAGS_IMAGE);   // needs storage use (img_share_decide)
+    akey ki = k; ki.d.flags |= NVN_TEXTURE_FLAGS_IMAGE;   // (share: the key of a texture with IMAGE that could not share, its image of its own as before)
     int from_storage = sp_pool && !(t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET | NVN_TEXTURE_FLAGS_COMPRESSIBLE | NVN_TEXTURE_FLAGS_IMAGE));
     int keyed = t->pool != NULL;
     pthread_mutex_lock(&g_img_mu);
-    vkimg_t *im = keyed ? nvn_hm_get(&g_by_key, &k) : nvn_hm_get(&g_by_serial, &t->serial);
-    int fresh = 0;
+    vkimg_t *im = keyed ? nvn_hm_get(&g_by_key, need ? &ki : &k) : nvn_hm_get(&g_by_serial, &t->serial);
+    int fresh = 0, sep = 0; unsigned why = 0; akey kb = k;   // sep: an image of its own beside the one under kb (share: 1 the key without IMAGE, 2 its twin's), why: the SHX_ reasons
+    if (!im && share) {   // the other key: a texture without IMAGE takes the image of its own a texture with IMAGE has (the one it stood beside went), one with IMAGE the shared one
+        if (!need) im = nvn_hm_get(&g_by_key, &ki);
+        else if ((im = nvn_hm_get(&g_by_key, &k)) && !(im = share_found(im, t, f, 1, 0, &why))) { kb = k; sep = 1; }
+    }
     // A texture over the storage of its sRGB / linear twin (the key differs only by the other format of the pair) is a view of that image: what one writes, the other reads. Mario Kart
     // World's Grand Prix movie draws its YUV pass into an RGBA8 target and composites it through an RGBA8_SRGB texture: as an image of its own, a frozen frame (upstream 92f223a7, #1110).
-    // The image must take views in the twin format: mutable, or format-listed with it (DM_VK_UBWC: fixed_fmt, fmt2)
-    if (!im && keyed) { const uint8_t *tw = nvn_twins(t->d.format);
-        for (int j = 0; j < 3 && tw[j] && !im; j++) { akey kt = k; kt.d.format = tw[j]; vkimg_t *o = nvn_hm_get(&g_by_key, &kt);
-            if (o && !o->sp && !o->dn && !o->lv0 && (o->cflags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) && (!o->fixed_fmt || o->fmt2 == f->vk)) { im = o; static int n; if (n++ < 8) VKLOG("texture %ux%u nvn format %#x: a view of its sRGB / linear twin's image (format %#x) over the same storage", t->d.width, t->d.height, t->d.format, tw[j]); } } }
+    // The image must take views in the twin format: mutable, or format-listed with it (DM_VK_UBWC: fixed_fmt, fmt2). Shared (DM_VK_IMAGE_SHARE): never upgraded (share_excl)
+    if (!im && !sep && keyed) { const uint8_t *tw = nvn_twins(t->d.format);
+        for (int j = 0; j < 3 && tw[j] && !im && !sep; j++) { akey kt = k; kt.d.format = tw[j]; vkimg_t *o = nvn_hm_get(&g_by_key, &kt);
+            if (o && !o->sp && !o->dn && !o->lv0 && (o->cflags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) && (!o->fixed_fmt || o->fmt2 == f->vk)) {
+                if (share && !(o = share_found(o, t, f, need, 1, &why))) { kb = kt; sep = 2; break; }
+                im = o; static int n; if (n++ < 8) VKLOG("texture %ux%u nvn format %#x: a view of its sRGB / linear twin's image (format %#x) over the same storage", t->d.width, t->d.height, t->d.format, tw[j]); } } }
     if (!im) {
-        // A colour texture's key keeps IMAGE (its image's storage use), so two texture objects over the same storage that differ only by it are two images: a compute shader's
-        // writes through the IMAGE one are not seen through the other, where on the Switch they are the same texels (upstream left IMAGE out of the key: XC3's material tags,
-        // nvn_mtl.m tex_upgrade). Said for the first cases, to tell whether a game does it ([RED]: what one writes the other never reads)
-        if (keyed && !(f->depth || f->stencil)) { akey ki = k; ki.d.flags ^= NVN_TEXTURE_FLAGS_IMAGE; vkimg_t *o = nvn_hm_get(&g_by_key, &ki);
+        // Two images over the same storage that differ only by IMAGE (DM_VK_IMAGE_SHARE=0, or a texture with IMAGE that could not share: sep): a compute shader's writes through the
+        // IMAGE one are not seen through the other, where on the Switch they are the same texels (upstream left IMAGE out of the key: XC3's material tags, nvn_mtl.m tex_upgrade). Said
+        // for the first cases, to tell whether a game does it ([RED]: what one writes the other never reads); shared, with what kept them apart
+        if (keyed && colour && !share) { akey kx = k; kx.d.flags ^= NVN_TEXTURE_FLAGS_IMAGE; vkimg_t *o = nvn_hm_get(&g_by_key, &kx);
             static int ns; if (o && ns++ < 8) VKLOG("[RED] texture %ux%u nvn format %#x at %+lld: a second image beside the one %s IMAGE over the same storage (%llu so far): writes through one are not seen through the other",
                 t->d.width, t->d.height, t->d.format, (long long)t->off, (k.d.flags & NVN_TEXTURE_FLAGS_IMAGE) ? "without" : "with", (unsigned long long)ns); }
         int gpu = !(from_storage || packaged_tex(t));
@@ -1154,10 +1257,14 @@ static vkimg_t *vk_tex_(const tex_t *t) {
         if (!im && sp_pool && !gpu && t->L.size > dense_cap()) im = dense_make(tc, f);   // (sampled, too large to be made whole: a dense image from its base)
         if (!im && sp_pool && !sp_whole_ok(t)) { pthread_mutex_unlock(&g_img_mu); return NULL; }
         if (!im && keyed) evict_overlaps(k.pool, t->off, (int64_t)t->L.size);
+        if (sep && !nvn_hm_get(&g_by_key, &kb)) sep = 0;   // the image it would stand beside went (evict_overlaps: not looked up for EVICT_KEEP presents): one image after all
+        if (sep) { static int ns; char w[192]; shx_text(why, w, sizeof w);
+            if (ns++ < 8) VKLOG("[RED] texture %ux%u nvn format %#x at %+lld: a second image beside the one without IMAGE over the same storage (%llu so far; %s): writes through one are not seen through the other",
+                t->d.width, t->d.height, t->d.format, (long long)t->off, (unsigned long long)ns, w); }
         if (!im) im = img_new(tc, f);
         if (!im) { pthread_mutex_unlock(&g_img_mu); return NULL; }
         im->pool = k.pool; im->off = t->off; im->size = (int64_t)t->L.size; im->flags = tc->d.flags; g_img_n++; g_img_bytes += im->sp ? 0 : im->dn ? im->dn->bytes : t->L.size;
-        if (keyed) { alias_link(im); nvn_hm_put(&g_by_key, &k, im); } else nvn_hm_put(&g_by_serial, &t->serial, im);
+        if (keyed) { alias_link(im); nvn_hm_put(&g_by_key, sep == 1 ? &ki : &k, im); } else nvn_hm_put(&g_by_serial, &t->serial, im);   // (beside its twin's: its own format's key is free)
         fresh = 1; img_big_said(im, tc, f, sp_pool, gpu);
     }
     im->used = g_tex_frame;

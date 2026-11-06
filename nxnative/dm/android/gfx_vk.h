@@ -145,6 +145,8 @@ struct vkimg {
     // discarded (veto: its store is never left out again), and the times a discard was followed by a whole write (a clear or a discard as a pass's load) before any read (ok)
     uint8_t dsc_pend, dsc_drop, dsc_veto, dsc_ok[3];   // (aspect bits: gfx_vk_exec.c VK_DSC_COLOR, _DEPTH, _STENCIL)
     uint64_t kept_gen;                // a view of it is in a descriptor set kept across submissions since that keep generation (gfx_vk_exec.c g_kgen): dropping its views then drops them (g_tex_kgen)
+    uint64_t msub;                    // 1 + the submission (vk_sub_serial) whose main command buffers last wrote it or took it out of UNDEFINED (vk_img_wrote, vk_tex_prepare): an upgrade's
+                                      // copy (gfx_vk_tex.c img_upgrade), in the upload command buffer that runs before them, would miss what they did
 };
 void vk_dsc_read_(vkimg_t *im, const char *how);   // its contents read other than as an attachment (sampled, a storage image, a copy's source, read back, presented): gfx_vk_exec.c
 static inline void vk_dsc_read(vkimg_t *im, const char *how) { if (im && im->dsc_pend) vk_dsc_read_(im, how); }
@@ -194,7 +196,7 @@ typedef struct {
     uint32_t local[3];
     uint8_t dyn[96]; int ndyn;          // bindings of uniform buffers bound with a dynamic offset (gfx_vk_exec.c stage_set), and their count
     int xfb; uint32_t xfb_stride[4];    // a vertex shader that captures transform feedback (its SPIR-V has the Xfb execution mode), and each buffer's stride
-    uint32_t *spv, nspv;                // its SPIR-V as the module was made from it, for the variants below
+    uint32_t *spv, nspv;                // its SPIR-V as the module was made from it: NULL once the module is made unless kept (gfx_vk_shader.c spv_kept_for_readers, DM_VK_SPV_KEEP=1), the variants then rebuild it; nspv its length either way
     struct { uint64_t um, im; uint32_t xo; int fd; VkShaderModule mod; uint64_t lm; } var[16]; int nvar;   // variants whose sampled bindings (bit = index in b) of an integer view read uint (um) / int (im) texels,
                                                                                     // that declare the vec4 outputs xo (bit = location) the next stage reads, and (fd) that write gl_FragDepth = gl_FragCoord.z
     int depth_repl;                     // a fragment shader that writes gl_FragDepth (DepthReplacing / DepthGreater / DepthLess)

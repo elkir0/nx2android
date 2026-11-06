@@ -1482,8 +1482,18 @@ void mtl_sub_begin(void) {
     vk_exec_reset();
 }
 void mtl_sub_event(volatile uint32_t *val, uint32_t mode, uint32_t v) { post((post_op){1, val, mode, v, 0, 0, -1}); }
+// Counter census (Mario Kart World's trees flicker: does it cull by SAMPLES_PASSED reports, and does it clear them before our completion write?); replay thread only
+uint64_t g_ctr_n[18], g_ctr_reset[18], g_ctr_zero, g_ctr_seen; int g_ctr_early, g_x_subidle, g_ts_cal, g_ts_flat;   // g_ts_cal: DM_VK_TS_CAL, g_ts_flat: DM_VK_TS_FLAT (completion_main)   // DM_VK_CTR_EARLY, DM_VK_X_SUBIDLE (live, gfx_vk_exec.c x_read)
+static uint64_t gpu_ticks(void);
 void mtl_sub_counter(uint64_t addr, uint32_t type) {
-    vksub_t *s = cur(); int q = -1;
+    vksub_t *s = cur(); int q = -1; uint32_t ti = type < 17 ? type : 17; uint64_t tot = 0;
+    if (++g_ctr_n[ti] == 1) VKLOG("counter: type %#x first reported (%llu resets of it so far)", type, (unsigned long long)g_ctr_reset[ti]);
+    for (int i = 0; i < 18; i++) tot += g_ctr_n[i];
+    if (tot % 4096 == 0) VKLOG("counter: %llu reports (timestamp %llu, samples passed %llu, top %llu, other %llu), %llu samples resets; samples records found zero at completion %llu of %llu; early write %d",
+                               (unsigned long long)tot, (unsigned long long)g_ctr_n[0], (unsigned long long)g_ctr_n[1], (unsigned long long)g_ctr_n[16], (unsigned long long)(tot - g_ctr_n[0] - g_ctr_n[1] - g_ctr_n[16]),
+                               (unsigned long long)g_ctr_reset[1], (unsigned long long)g_ctr_zero, (unsigned long long)g_ctr_seen, g_ctr_early);
+    // DM_VK_CTR_EARLY=1: a SAMPLES_PASSED report is also written now, at replay, not only once the GPU has finished: a game that reads it sooner sees "visible", not 0
+    if (g_ctr_early && type == NVN_COUNTER_TYPE_SAMPLES_PASSED) { uint64_t rec[2] = {1u << 20, gpu_ticks()}; void *at = vk_cpu_ptr(addr, sizeof rec); if (at) memcpy(at, rec, sizeof rec); }
     if (g_cq && (type == 0 || type == 0x10) && s->ncq < CQ) { q = g_cur * CQ + s->ncq++; vkCmdWriteTimestamp(vk_cmd(), VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_cq, (uint32_t)q); }
     post((post_op){2, NULL, 0, 0, addr, type, q});
 }
@@ -1686,15 +1696,27 @@ static void *completion_main(void *a) {
         }
         uint64_t now = gpu_ticks(), tend = 0;
         if (g_tsq && c->slot >= 0) { uint64_t t[2]; if (vkGetQueryPoolResults(V.dev, g_tsq, 2 * (uint32_t)c->slot, 2, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) tend = t[1]; }
+        // A report's time was this thread's clock when it got here, less the GPU time from the report to the submission's end: its lateness (the fence wait's wake-up, the copy-back,
+        // the submissions queued before) differs from one submission to the next by milliseconds, so reports of two submissions disagreed by that much, and a game that takes a
+        // frame's GPU time from reports in two submissions saw it jump frame to frame. DM_VK_TS_CAL=1 (live, A/B): the GPU's clock plus the smallest lateness seen over the last 256
+        // submissions (the closest to none, kept current against drift), the same offset for every report
+        static int64_t cal_min[256]; static unsigned cal_n; int64_t cal_off = INT64_MAX;
+        if (tend) { cal_min[cal_n++ & 255] = (int64_t)nvn_timestamp_from_ns((uint64_t)((double)tend * V.props.limits.timestampPeriod)) - (int64_t)now;   // (GPU − CPU, in NVN ticks: the largest is the least late)
+            if (g_ts_cal) { cal_off = INT64_MIN; for (unsigned k = 0; k < (cal_n < 256 ? cal_n : 256); k++) if (cal_min[k] > cal_off) cal_off = cal_min[k]; } }
         for (int i = 0; i < c->n; i++) {
             post_op *o = &c->ops[i];
             if (o->kind == 1) { volatile uint32_t *val = vk_cpu_ptr((uint64_t)(uintptr_t)o->val, 4); if (val) { if (o->mode == 1) *val += o->v; else *val = o->v; } continue; }
             uint64_t ts = now, tq;
-            if (o->q >= 0 && tend && vkGetQueryPoolResults(V.dev, g_cq, (uint32_t)o->q, 1, 8, &tq, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && tq <= tend) {
-                uint64_t back = nvn_timestamp_from_ns((uint64_t)((double)(tend - tq) * V.props.limits.timestampPeriod)); if (back < now) ts = now - back; }
+            // DM_VK_TS_FLAT=1 (live, debugging): every report of a submission at its completion time, so a game measures no GPU time between two of them
+            if (!g_ts_flat && o->q >= 0 && tend && vkGetQueryPoolResults(V.dev, g_cq, (uint32_t)o->q, 1, 8, &tq, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && tq <= tend) {
+                if (cal_off != INT64_MAX) ts = (uint64_t)((int64_t)nvn_timestamp_from_ns((uint64_t)((double)tq * V.props.limits.timestampPeriod)) - cal_off);   // (DM_VK_TS_CAL)
+                else { uint64_t back = nvn_timestamp_from_ns((uint64_t)((double)(tend - tq) * V.props.limits.timestampPeriod)); if (back < now) ts = now - back; } }
+            else if (!g_ts_flat && cal_off != INT64_MAX) ts = (uint64_t)((int64_t)nvn_timestamp_from_ns((uint64_t)((double)tend * V.props.limits.timestampPeriod)) - cal_off);   // (no query of its own: the submission's end)
             // render_cond: a timestamp report's counter field is 0, as on the GPU (gfx_vk_exec.c render_cond evaluates conditions on it)
             uint64_t rec[2] = {o->type == 0 || o->type == 0x10 ? (DM_GAME_RENDER_COND ? 0 : ts) : o->type == NVN_COUNTER_TYPE_SAMPLES_PASSED ? (1u << 20) : 0, ts};
-            void *at = vk_cpu_ptr(o->addr, sizeof rec); if (at) memcpy(at, rec, sizeof rec);
+            void *at = vk_cpu_ptr(o->addr, sizeof rec);
+            if (at && o->type == NVN_COUNTER_TYPE_SAMPLES_PASSED) { uint64_t old; memcpy(&old, at, 8); g_ctr_seen++; g_ctr_zero += old == 0; }   // census: the game cleared it (or it was never written)
+            if (at) memcpy(at, rec, sizeof rec);
         }
         pthread_mutex_lock(&g_cmu); g_ch = c->next; if (!g_ch) g_ct = NULL; pthread_mutex_unlock(&g_cmu);
         if (g_prereset > 0 && c->rslot >= 0) { vksub_t *s = &g_slot[c->rslot];   // its command buffers reset here (slot_recycle); the slot is not taken before g_done passes this fence
@@ -1754,6 +1776,7 @@ uint64_t mtl_sub_commit(void) {
     s->npost = 0; g_cur = -1;
     pthread_mutex_unlock(&g_sub_lock);
     vk_mem_log();   // (DM_VK_MEMLOG: rate-limited by itself)
+    if (g_x_subidle) mtl_wait(f, 2000000000ull);   // DM_VK_X_SUBIDLE=1 (live, slow): the submitting thread waits for the GPU to finish each submission, so no CPU work overlaps GPU work
     return f;
 }
 uint64_t mtl_last_fence(void) { return g_fence; }

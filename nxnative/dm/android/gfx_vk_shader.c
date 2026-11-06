@@ -288,12 +288,24 @@ static uint32_t *spv_add_outputs(const uint32_t *w, uint32_t nw, uint32_t mask, 
 }
 static nvn_hmap g_shaders = {.klen = 16};   // {key, stage} → vkshader_t*
 static pthread_mutex_t g_sh_mu = PTHREAD_MUTEX_INITIALIZER;
-// (gfx_vk_core.c vk_mem_log, the census) the shaders made so far, the SPIR-V they keep (s->spv: each one's, rewritten for its set, kept for its variants; the driver's module holds
-// another copy), their variants
+// A shader's SPIR-V is not kept once its module is made (s->spv NULL, s->nspv its length): a variant (vk_shader_module_: integer-texel views, outputs added, fragment depth, alpha test,
+// dual source, the mesh A/B, LOD shift) rebuilds the words from the mapped bundle (shader_words: the same words every time), makes its module from them and frees them. Kept, each
+// shader's rewritten copy was host heap for the whole run, swapped with the rest: Mario Kart World on the phone (16 GB, near the low-memory killer) kept 286 MB of it for 4,813 shaders,
+// where a variant is made once per shader and variant (the cache below). Kept still: every shader's with DM_VK_SPV_KEEP=1 (start-up, the old behaviour), and those another file reads
+// (spv_kept_for_readers)
+static uint64_t g_spv_rebuilds;   // variants made from rebuilt words (under g_sh_mu)
+static int spv_keep_all(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_SPV_KEEP"); on = e && atoi(e); } return on; }
+// (gfx_vk_core.c vk_mem_log, the census) the shaders made so far, the SPIR-V they keep (s->spv, rewritten for its set; the driver's module holds another copy), their variants; o[3] and a
+// line of its own (the census line of gfx_vk_core.c prints o[0..2]): the shaders whose words were dropped, and how many variants rebuilt them
 void vk_shader_mem(uint64_t o[4]) {
+    uint64_t kept = 0, kb = 0, dropped = 0, db = 0, rb;
     pthread_mutex_lock(&g_sh_mu);
-    for (uint32_t i = 0; i < g_shaders.cap; i++) { vkshader_t *s = g_shaders.vals[i]; if (!s || s == (void *)1) continue; o[0]++; o[1] += (uint64_t)s->nspv * 4; o[2] += (uint64_t)s->nvar; }
+    for (uint32_t i = 0; i < g_shaders.cap; i++) { vkshader_t *s = g_shaders.vals[i]; if (!s || s == (void *)1) continue; o[0]++; o[2] += (uint64_t)s->nvar;
+        if (s->spv) { kept++; kb += (uint64_t)s->nspv * 4; } else { dropped++; db += (uint64_t)s->nspv * 4; } }
+    o[1] += kb; rb = g_spv_rebuilds; o[3] += rb;
     pthread_mutex_unlock(&g_sh_mu);
+    VKLOG("memory census: shaders' SPIR-V kept for %llu (%.1f MB), dropped once their module was made for %llu (%.1f MB not held; DM_VK_SPV_KEEP=1 keeps them), rebuilt from the bundle for %llu variants",
+          (unsigned long long)kept, kb / 1048576.0, (unsigned long long)dropped, db / 1048576.0, (unsigned long long)rb);
 }
 // Shared layouts keep pipeline layouts and descriptor bindings reusable across shaders; g_sh_mu protects this cache too.
 static VkDescriptorSetLayout shader_layout(const VkDescriptorSetLayoutBinding *b, uint32_t n) {
@@ -312,6 +324,70 @@ static VkDescriptorSetLayout shader_layout(const VkDescriptorSetLayoutBinding *b
         nvn_hm_put(&cache, &k, layout);
     }
     return layout;
+}
+// A shader's SPIR-V as its module is made from it: the bundle's words copied and rewritten for the device. The same words at every call: only the bundle (mapped read-only, never
+// unmapped), the shader's stage and set and the device's facts decide them. first (vk_shader): also the facts read from them into s (xfb and its strides, depth_repl, in_locs / out_locs,
+// prim_locs, col0, lod_ops) and the NDSR line; else (a variant's rebuild, vk_shader_module_) s is not written. Under g_sh_mu either way. NULL without memory; *onw its length in words
+static uint32_t *shader_words(vkshader_t *s, const bent *e, uint32_t *onw, int first) {
+    const int stage = s->stage; uint32_t nw = e->spv_len / 4; uint32_t *w = malloc(e->spv_len); if (!w) return NULL; memcpy(w, g_bundle + e->spv_off, e->spv_len);
+    int f64_used = 0, xfb = 0, depth_repl = 0; uint32_t xb = 4, stride[4] = {0};
+    for (uint32_t i = 5; i < nw;) { uint32_t n = w[i] >> 16, op = w[i] & 0xffff; if (!n) break; if (op == 71 && n >= 4 && w[i + 2] == 34) w[i + 3] = (uint32_t)s->set;   // OpDecorate DescriptorSet
+        if (op == 22 && n == 3 && w[i + 2] == 64) f64_used = 1;   // OpTypeFloat 64
+        if (op == 16 && n >= 3 && w[i + 2] == 11) xfb = 1;        // OpExecutionMode Xfb: a vertex shader that captures transform feedback (shader_vk.py xfb_layout)
+        if (op == 16 && n >= 3 && (w[i + 2] == 12 || w[i + 2] == 14 || w[i + 2] == 15)) depth_repl = 1;   // OpExecutionMode DepthReplacing / DepthGreater / DepthLess
+        // each buffer's stride: the translator decorates an output XfbBuffer b, then XfbStride s (OpDecorate, or OpMemberDecorate for gl_Position's block)
+        { uint32_t d = op == 71 && n >= 4 ? w[i + 2] : op == 72 && n >= 5 ? w[i + 3] : 0, v = op == 71 ? w[i + 3] : op == 72 && n >= 5 ? w[i + 4] : 0;
+          if (d == 36) xb = v; else if (d == 37 && xb < 4) stride[xb] = v; }
+        i += n; }
+    // without VK_EXT_transform_feedback the capture declarations would make the module invalid: they are dropped (the capture's draws then write nothing, as before)
+    if (xfb && !V.has_xfb) { uint32_t o = 5;
+        for (uint32_t i = 5; i < nw;) { uint32_t n = w[i] >> 16, op = w[i] & 0xffff; if (!n || i + n > nw) { while (i < nw) w[o++] = w[i++]; break; }
+            int drop = (op == 17 && n == 2 && w[i + 1] == 53) || (op == 16 && n >= 3 && w[i + 2] == 11) ||   // OpCapability TransformFeedback, OpExecutionMode Xfb
+                       (op == 71 && n >= 3 && (w[i + 2] == 36 || w[i + 2] == 37)) || (op == 72 && n >= 4 && (w[i + 3] == 36 || w[i + 3] == 37));   // XfbBuffer / XfbStride
+            if (drop) i += n; else for (uint32_t k = 0; k < n; k++) w[o++] = w[i++]; }
+        nw = o; xfb = 0; if (first) VKRED_ONCE(90, "the device has no transform feedback: shaders that capture it run without"); }
+    // the translator declares Float64 in every shader; the device has shaderFloat64 off (Adreno has none), which makes the declaration invalid: when the
+    // shader has no 64-bit float type it becomes a second Shader declaration
+    if (!f64_used) for (uint32_t i = 5; i < nw;) { uint32_t n = w[i] >> 16, op = w[i] & 0xffff; if (!n || op != 17) break; if (n == 2 && w[i + 1] == 10) w[i + 1] = 1; i += n; }
+    // the translator declares fragment shader interlock in every pixel shader; the device has no VK_EXT_fragment_shader_interlock: when the shader uses no
+    // interlock instruction, its OpCapability and OpExtension are dropped
+    { int used = 0; for (uint32_t i = 5; i < nw;) { uint32_t n = w[i] >> 16, op = w[i] & 0xffff; if (!n) break; if (op == 5364 || op == 5365) used = 1; i += n; }   // OpBegin/EndInvocationInterlockEXT
+      if (!used) { uint32_t o = 5;
+        for (uint32_t i = 5; i < nw;) { uint32_t n = w[i] >> 16, op = w[i] & 0xffff; if (!n || i + n > nw) { while (i < nw) w[o++] = w[i++]; break; }
+            int drop = (op == 17 && n == 2 && (w[i + 1] == 5378 || w[i + 1] == 5363 || w[i + 1] == 5372)) ||   // FragmentShader{Pixel,Sample,ShadingRate}InterlockEXT
+                       (op == 10 && !memcmp(&w[i + 1], "SPV_EXT_fragment_shader_interlock", 33));
+            if (drop) i += n; else for (uint32_t k = 0; k < n; k++) w[o++] = w[i++]; }
+        nw = o; } }
+    if (stage == 0) { uint32_t n2 = 0, *w2 = spv_vs_init(w, nw, &n2); if (w2) { free(w); w = w2; nw = n2; } }
+    *onw = nw;
+    if (!first) return w;
+    s->xfb = xfb; memcpy(s->xfb_stride, stride, sizeof stride); s->depth_repl = depth_repl;
+    spv_io_locs(w, nw, &s->in_locs, &s->out_locs);
+    if (stage == 7) s->prim_locs = spv_prim_locs(w, nw);
+    if (stage == 1) s->col0 = spv_col0(w, nw, NULL, NULL, NULL);   // (the alpha test: gfx_vk_exec.c pkey atest)
+    { uint64_t lb = spv_lod_bindings(w, nw); s->lod_ops = 0; for (int i = 0; i < s->nbind && i < 64; i++) if (lb >> (s->b[i].binding & 63) & 1) s->lod_ops |= 1ull << i; }   // (LOD shifts: vk_lodshift_mask)
+    // A compute shader that runs Ampere's tensor instructions per lane (the translator's HMMA helper dmsh_hmma16816_f16: 64 FP32 FMAs and 64 conversions a lane an HMMA; LDSM / MOVM
+    // through subgroup shuffles): agl's NDSR upscaler network, whose 30 shaders Mario Kart World 1.8.0 loads at boot and the game engages as its render size falls (PARITY G4). Said
+    // once a shader, at its load: its first dispatch, the bundle having more compute shaders than compute_warm makes ahead
+    if (stage == 5) { uint32_t hf = 0, calls = 0, shuf = 0;
+        for (uint32_t i = 5; i < nw;) { uint32_t n = w[i] >> 16, op = w[i] & 0xffff; if (!n || i + n > nw) break;
+            if (op == 5 && n >= 7 && !memcmp(&w[i + 2], "dmsh_hmma16816_f16", 18)) hf = w[i + 1];   // OpName
+            if (op == 57 && n >= 4 && hf && w[i + 3] == hf) calls++; if (op == 345) shuf++;   // OpFunctionCall, OpGroupNonUniformShuffle
+            i += n; }
+        if (calls) VKLOG("compute shader %016llx: Ampere tensor instructions emulated per lane (%u HMMA, %u subgroup shuffles): agl's NDSR upscaler network, in use (DM_VK_GPUPROF: the stretch its dispatch falls in)",
+                         (unsigned long long)s->key, calls, shuf); }
+    return w;
+}
+// The words other files read from s->spv stay, their readers taking NULL as no code: a task or mesh shader's (gfx_vk_exec.c spv_model, its execution model, and mesh_need, what the device
+// must take: Mario Kart World's 7 task and 18 mesh shaders), a game upscaler shader's (gfx_vk_fsr.c ndsr_shape_of, the NDSR swap's shape read from its code: DM_GAME_UPSCALER_KEYS, its 30)
+static int spv_kept_for_readers(const vkshader_t *s, const uint32_t *w, uint32_t nw) {
+    uint32_t model = ~0u;
+    for (uint32_t i = 5; i < nw;) { uint32_t n = w[i] >> 16, op = w[i] & 0xffff; if (!n || op == 54) break; if (op == 15 && n >= 3) { model = w[i + 1]; break; } i += n; }   // (as spv_model)
+    if (s->stage == 6 || s->stage == 7 || model == 5364 || model == 5365) return 1;   // TaskEXT, MeshEXT
+#ifdef DM_GAME_UPSCALER_KEYS
+    for (const char *k = DM_GAME_UPSCALER_KEYS; strnlen(k, 16) == 16; k += 17) { char b[17]; memcpy(b, k, 16); b[16] = 0; if (strtoull(b, NULL, 16) == s->key) return 1; if (k[16] != ',') break; }   // (as ndsr_named)
+#endif
+    return 0;
 }
 vkshader_t *vk_shader(uint64_t key, int stage) {
     bundle_auto();
@@ -333,54 +409,13 @@ vkshader_t *vk_shader(uint64_t key, int stage) {
     { uint32_t at = 20 + 20 * (uint32_t)s->nbind + s->c1_len, n = 0;
       if (e->refl_len >= at + 8 && !memcmp(r + at, "FSTR", 4)) { memcpy(&n, r + at + 4, 4);
           for (uint32_t i = 0; i < n && i < 4 && at + 8 + 12 * (i + 1) <= e->refl_len; i++) { memcpy(&s->first[i], r + at + 8 + 12 * i, 12); s->nfirst = (int)i + 1; } } }
-    // SPIR-V with the stage's set
-    uint32_t nw = e->spv_len / 4; uint32_t *w = malloc(e->spv_len); memcpy(w, g_bundle + e->spv_off, e->spv_len);
-    int f64_used = 0; uint32_t xb = 4;
-    for (uint32_t i = 5; i < nw;) { uint32_t n = w[i] >> 16, op = w[i] & 0xffff; if (!n) break; if (op == 71 && n >= 4 && w[i + 2] == 34) w[i + 3] = (uint32_t)s->set;   // OpDecorate DescriptorSet
-        if (op == 22 && n == 3 && w[i + 2] == 64) f64_used = 1;   // OpTypeFloat 64
-        if (op == 16 && n >= 3 && w[i + 2] == 11) s->xfb = 1;     // OpExecutionMode Xfb: a vertex shader that captures transform feedback (shader_vk.py xfb_layout)
-        if (op == 16 && n >= 3 && (w[i + 2] == 12 || w[i + 2] == 14 || w[i + 2] == 15)) s->depth_repl = 1;   // OpExecutionMode DepthReplacing / DepthGreater / DepthLess
-        // each buffer's stride: the translator decorates an output XfbBuffer b, then XfbStride s (OpDecorate, or OpMemberDecorate for gl_Position's block)
-        { uint32_t d = op == 71 && n >= 4 ? w[i + 2] : op == 72 && n >= 5 ? w[i + 3] : 0, v = op == 71 ? w[i + 3] : op == 72 && n >= 5 ? w[i + 4] : 0;
-          if (d == 36) xb = v; else if (d == 37 && xb < 4) s->xfb_stride[xb] = v; }
-        i += n; }
-    // without VK_EXT_transform_feedback the capture declarations would make the module invalid: they are dropped (the capture's draws then write nothing, as before)
-    if (s->xfb && !V.has_xfb) { uint32_t o = 5;
-        for (uint32_t i = 5; i < nw;) { uint32_t n = w[i] >> 16, op = w[i] & 0xffff; if (!n || i + n > nw) { while (i < nw) w[o++] = w[i++]; break; }
-            int drop = (op == 17 && n == 2 && w[i + 1] == 53) || (op == 16 && n >= 3 && w[i + 2] == 11) ||   // OpCapability TransformFeedback, OpExecutionMode Xfb
-                       (op == 71 && n >= 3 && (w[i + 2] == 36 || w[i + 2] == 37)) || (op == 72 && n >= 4 && (w[i + 3] == 36 || w[i + 3] == 37));   // XfbBuffer / XfbStride
-            if (drop) i += n; else for (uint32_t k = 0; k < n; k++) w[o++] = w[i++]; }
-        nw = o; s->xfb = 0; VKRED_ONCE(90, "the device has no transform feedback: shaders that capture it run without"); }
-    // the translator declares Float64 in every shader; the device has shaderFloat64 off (Adreno has none), which makes the declaration invalid: when the
-    // shader has no 64-bit float type it becomes a second Shader declaration
-    if (!f64_used) for (uint32_t i = 5; i < nw;) { uint32_t n = w[i] >> 16, op = w[i] & 0xffff; if (!n || op != 17) break; if (n == 2 && w[i + 1] == 10) w[i + 1] = 1; i += n; }
-    // the translator declares fragment shader interlock in every pixel shader; the device has no VK_EXT_fragment_shader_interlock: when the shader uses no
-    // interlock instruction, its OpCapability and OpExtension are dropped
-    { int used = 0; for (uint32_t i = 5; i < nw;) { uint32_t n = w[i] >> 16, op = w[i] & 0xffff; if (!n) break; if (op == 5364 || op == 5365) used = 1; i += n; }   // OpBegin/EndInvocationInterlockEXT
-      if (!used) { uint32_t o = 5;
-        for (uint32_t i = 5; i < nw;) { uint32_t n = w[i] >> 16, op = w[i] & 0xffff; if (!n || i + n > nw) { while (i < nw) w[o++] = w[i++]; break; }
-            int drop = (op == 17 && n == 2 && (w[i + 1] == 5378 || w[i + 1] == 5363 || w[i + 1] == 5372)) ||   // FragmentShader{Pixel,Sample,ShadingRate}InterlockEXT
-                       (op == 10 && !memcmp(&w[i + 1], "SPV_EXT_fragment_shader_interlock", 33));
-            if (drop) i += n; else for (uint32_t k = 0; k < n; k++) w[o++] = w[i++]; }
-        nw = o; } }
-    if (stage == 0) { uint32_t n2 = 0, *w2 = spv_vs_init(w, nw, &n2); if (w2) { free(w); w = w2; nw = n2; } }
-    spv_io_locs(w, nw, &s->in_locs, &s->out_locs);
-    if (stage == 7) s->prim_locs = spv_prim_locs(w, nw);
-    if (stage == 1) s->col0 = spv_col0(w, nw, NULL, NULL, NULL);   // (the alpha test: gfx_vk_exec.c pkey atest)
-    { uint64_t lb = spv_lod_bindings(w, nw); for (int i = 0; i < s->nbind && i < 64; i++) if (lb >> (s->b[i].binding & 63) & 1) s->lod_ops |= 1ull << i; }   // (LOD shifts: vk_lodshift_mask)
-    // A compute shader that runs Ampere's tensor instructions per lane (the translator's HMMA helper dmsh_hmma16816_f16: 64 FP32 FMAs and 64 conversions a lane an HMMA; LDSM / MOVM
-    // through subgroup shuffles): agl's NDSR upscaler network, whose 30 shaders Mario Kart World 1.8.0 loads at boot and the game engages as its render size falls (PARITY G4). Said
-    // once a shader, at its load: its first dispatch, the bundle having more compute shaders than compute_warm makes ahead
-    if (stage == 5) { uint32_t hf = 0, calls = 0, shuf = 0;
-        for (uint32_t i = 5; i < nw;) { uint32_t n = w[i] >> 16, op = w[i] & 0xffff; if (!n || i + n > nw) break;
-            if (op == 5 && n >= 7 && !memcmp(&w[i + 2], "dmsh_hmma16816_f16", 18)) hf = w[i + 1];   // OpName
-            if (op == 57 && n >= 4 && hf && w[i + 3] == hf) calls++; if (op == 345) shuf++;   // OpFunctionCall, OpGroupNonUniformShuffle
-            i += n; }
-        if (calls) VKLOG("compute shader %016llx: Ampere tensor instructions emulated per lane (%u HMMA, %u subgroup shuffles): agl's NDSR upscaler network, in use (DM_VK_GPUPROF: the stretch its dispatch falls in)",
-                         (unsigned long long)key, calls, shuf); }
-    VkShaderModuleCreateInfo ci ={VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, (size_t)nw * 4, w};
-    VkResult vr = vkCreateShaderModule(V.dev, &ci, NULL, &s->mod); s->spv = w; s->nspv = nw;
+    // SPIR-V with the stage's set, and the facts read from it (shader_words)
+    uint32_t nw = 0, *w = shader_words(s, e, &nw, 1);
+    VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, (size_t)nw * 4, w};
+    VkResult vr = w ? vkCreateShaderModule(V.dev, &ci, NULL, &s->mod) : VK_ERROR_OUT_OF_HOST_MEMORY;
     if (vr) { VKLOG("[RED] shader %016llx: vkCreateShaderModule %d", (unsigned long long)key, vr); free(w); free(s); nvn_hm_put(&g_shaders, &hk, (void *)1); pthread_mutex_unlock(&g_sh_mu); return NULL; }
+    // the words go now that the driver has its module: a variant rebuilds them (vk_shader_module_); DM_VK_SPV_KEEP=1, and the shaders other files read the words of, keep them
+    s->nspv = nw; if (spv_keep_all() || spv_kept_for_readers(s, w, nw)) s->spv = w; else free(w);
     // descriptor set layout: one entry per binding
     // The game's constant buffers and the driver segment are dynamic uniform buffers: their offset is given when the set is bound, so a set matches any draw's
     // with the same buffers (Unity updates a constant buffer before nearly every draw, and each update is a shadow at a new offset: NEO made a new set for
@@ -504,8 +539,10 @@ static uint32_t *spv_frag_depth(const uint32_t *w, uint32_t nw, uint32_t *onw) {
 }
 // DM_VK_SPV_DIR=<dir> with DM_VK_SPV_ALT=1 (live, debugging): pipelines made while it is on use <dir>/<key>.spv in place of the bundle's code where the file
 // exists (same bindings), so two compilations of a shader can be compared in one run: the translator's module through spirv-opt, its GLSL through glslc...
-static VkShaderModule alt_module(vkshader_t *s) {
-    const char *dir = getenv("DM_VK_SPV_DIR"); char path[512]; if (!dir) return s->mod;
+// Its words are read from the file each time its module is made (once: vk_shader_module_ keeps it as a variant), never kept in s->spv: nothing of them is lost when the
+// bundle's words are dropped, and the shader's other variants are made from the bundle's words, rebuilt, as without it
+static VkShaderModule alt_module(vkshader_t *s, int which) {   // which 2: DM_VK_SPV_DIR2 (gfx_vk_exec.c DM_VK_X_CSALT=2)
+    const char *dir = getenv(which == 2 ? "DM_VK_SPV_DIR2" : "DM_VK_SPV_DIR"); char path[512]; if (!dir) return s->mod;
     snprintf(path, sizeof path, "%s/%016llx.spv", dir, (unsigned long long)s->key); FILE *f = fopen(path, "rb"); if (!f) return s->mod;
     fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET); uint32_t *w = n > 20 && !(n & 3) ? malloc((size_t)n) : NULL; VkShaderModule m = s->mod;
     if (w && fread(w, 1, (size_t)n, f) == (size_t)n) { VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, (size_t)n, w};
@@ -768,29 +805,37 @@ static VkShaderModule vk_shader_module_(vkshader_t *s, uint64_t um, uint64_t im,
     if (s->stage != 7) mp = mb = 0;
     int fv = fd | dual << 1 | at << 2 | mp << 3 | mb << 4;   // (the variant's key)
     lm &= vk_lodshift_on() ? s->lod_ops : 0;   // (the bindings that take level numbers: vk_lodshift_mask)
-    if (!(um | im | xo | (uint32_t)fv | lm) || !s->spv) return s->mod;
-    if (xo == 1u << 31) {   // DM_VK_SPV_ALT
+    if (!(um | im | xo | (uint32_t)fv | lm)) return s->mod;   // (the alternative code below is read from its file, the variants from the words: kept or rebuilt)
+    if (xo == 1u << 31 || xo == (1u << 31 | 1u << 30)) {   // DM_VK_SPV_ALT; bit 30 too: DM_VK_X_CSALT=2's second folder
         pthread_mutex_lock(&g_sh_mu); for (int i = 0; i < s->nvar; i++) if (s->var[i].um == 0 && s->var[i].im == 0 && s->var[i].xo == xo) { VkShaderModule m = s->var[i].mod; pthread_mutex_unlock(&g_sh_mu); return m; }
-        VkShaderModule m = alt_module(s); if (s->nvar < 16) s->var[s->nvar++] = (typeof(s->var[0])){0, 0, xo, 0, m}; pthread_mutex_unlock(&g_sh_mu); return m; }
+        VkShaderModule m = alt_module(s, xo >> 30 & 1 ? 2 : 1); if (s->nvar < 16) s->var[s->nvar++] = (typeof(s->var[0])){0, 0, xo, 0, m}; pthread_mutex_unlock(&g_sh_mu); return m; }
     xo &= ~(1u << 31);
     pthread_mutex_lock(&g_sh_mu);
     for (int i = 0; i < s->nvar; i++) if (s->var[i].um == um && s->var[i].im == im && s->var[i].xo == xo && s->var[i].fd == fv && s->var[i].lm == lm) { VkShaderModule m = s->var[i].mod; pthread_mutex_unlock(&g_sh_mu); return m; }
     uint16_t bind[64]; uint8_t kind[64]; int nb = 0;
     for (int i = 0; i < s->nbind && i < 64; i++) if ((um | im) >> i & 1) { bind[nb] = s->b[i].binding; kind[nb++] = um >> i & 1 ? 1 : 2; }
-    uint32_t nw = s->nspv, *w = nb ? spv_int_images(s->spv, s->nspv, bind, kind, nb, &nw) : NULL; VkShaderModule m = s->mod;
+    // the words the variant starts from: the shader's kept ones (DM_VK_SPV_KEEP=1, spv_kept_for_readers), or rebuilt from the bundle as vk_shader made them (shader_words), under
+    // g_sh_mu as the variant is made, and freed once its module is
+    uint32_t nbase = s->nspv, *own = NULL; const uint32_t *base = s->spv;
+    if (!base) { const bent *e = g_bundle ? find(s->key) : NULL; base = own = e ? shader_words(s, e, &nbase, 0) : NULL;
+        if (!own) { pthread_mutex_unlock(&g_sh_mu); static int nfail; if (nfail++ < 16) VKLOG("[RED] shader %016llx: its SPIR-V could not be rebuilt from the bundle (%s): no variant this time, the module as it is",
+                                                                                         (unsigned long long)s->key, e ? "no memory" : "not found"); return s->mod; }
+        if (nbase != s->nspv) VKRED_ONCE(171, "shader %016llx: its SPIR-V rebuilt for a variant is %u words, %u when its module was made", (unsigned long long)s->key, nbase, s->nspv);
+        g_spv_rebuilds++; }
+    uint32_t nw = nbase, *w = nb ? spv_int_images(base, nbase, bind, kind, nb, &nw) : NULL; VkShaderModule m = s->mod;
     // a fragment shader's xo: the inputs a mesh shader writes per primitive (vkshader_t prim_locs), decorated PerPrimitiveEXT (spv_per_primitive); another stage's: outputs to declare
-    if (xo && (w || !nb) && s->stage == 1) { uint32_t n2 = 0, *w2 = spv_per_primitive(w ? w : s->spv, nw, xo, &n2); free(w); w = w2; nw = n2; }
-    else if (xo && (w || !nb)) { uint32_t n2 = 0, *w2 = spv_add_outputs(w ? w : s->spv, nw, xo, &n2); free(w); w = w2; nw = n2;
+    if (xo && (w || !nb) && s->stage == 1) { uint32_t n2 = 0, *w2 = spv_per_primitive(w ? w : base, nw, xo, &n2); free(w); w = w2; nw = n2; }
+    else if (xo && (w || !nb)) { uint32_t n2 = 0, *w2 = spv_add_outputs(w ? w : base, nw, xo, &n2); free(w); w = w2; nw = n2;
         if (w && s->stage == 0) { uint32_t n3 = 0, *w3 = spv_vs_init(w, nw, &n3); if (w3) { free(w); w = w3; nw = n3; } } }   // the added outputs start as (0, 0, 0, 1) too
-    if (fd && (w || !(nb || xo))) { uint32_t n2 = 0, *w2 = spv_frag_depth(w ? w : s->spv, nw, &n2); free(w); w = w2; nw = n2; }
-    if (at && (w || !(nb || xo || fd))) { const char *why = NULL; uint32_t n2 = 0, *w2 = spv_alpha_test(w ? w : s->spv, nw, &n2, &why);   // (before spv_dual: colour 0 is location 0 alone)
+    if (fd && (w || !(nb || xo))) { uint32_t n2 = 0, *w2 = spv_frag_depth(w ? w : base, nw, &n2); free(w); w = w2; nw = n2; }
+    if (at && (w || !(nb || xo || fd))) { const char *why = NULL; uint32_t n2 = 0, *w2 = spv_alpha_test(w ? w : base, nw, &n2, &why);   // (before spv_dual: colour 0 is location 0 alone)
         if (w2) { free(w); w = w2; nw = n2; } else VKLOG("[RED] shader %016llx: no alpha test variant (%s): its alpha-tested draws go without the test", (unsigned long long)s->key, why ? why : "?"); }
-    if (dual && (w || !(nb || xo || fd))) { uint32_t n2 = 0, *w2 = spv_dual(w ? w : s->spv, nw, &n2); free(w); w = w2; nw = n2; }
-    if (mp && (w || !(nb || xo))) { uint32_t n2 = 0, *w2 = spv_payload_private(w ? w : s->spv, nw, &n2); free(w); w = w2; nw = n2; }
-    if (mb && (w || !(nb || xo || mp))) { uint32_t n2 = 0, *w2 = spv_pos_block(w ? w : s->spv, nw, &n2); free(w); w = w2; nw = n2; }
+    if (dual && (w || !(nb || xo || fd))) { uint32_t n2 = 0, *w2 = spv_dual(w ? w : base, nw, &n2); free(w); w = w2; nw = n2; }
+    if (mp && (w || !(nb || xo))) { uint32_t n2 = 0, *w2 = spv_payload_private(w ? w : base, nw, &n2); free(w); w = w2; nw = n2; }
+    if (mb && (w || !(nb || xo || mp))) { uint32_t n2 = 0, *w2 = spv_pos_block(w ? w : base, nw, &n2); free(w); w = w2; nw = n2; }
     if (lm && (w || !(nb || xo || fv))) { uint16_t lb[8]; int nl = 0; const char *why = NULL; uint32_t n2 = 0;   // (last: it adds to a push constant block the alpha test made)
         for (int i = 0; i < s->nbind && i < 64 && nl < 8; i++) if (lm >> i & 1) lb[nl++] = s->b[i].binding;
-        uint32_t *w2 = spv_lod_shift(w ? w : s->spv, nw, lb, nl, vk_lodshift_off(s->stage), &n2, &why);
+        uint32_t *w2 = spv_lod_shift(w ? w : base, nw, lb, nl, vk_lodshift_off(s->stage), &n2, &why);
         if (w2) { free(w); w = w2; nw = n2; } else VKLOG("[RED] shader %016llx: no LOD-shift variant (%s): its level numbers stay the image's", (unsigned long long)s->key, why ? why : "?"); }
     if (w) { VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, (size_t)nw * 4, w};
         if (vkCreateShaderModule(V.dev, &ci, NULL, &m)) { m = s->mod; VKLOG("[RED] shader %016llx: its variant was refused (bindings %#llx / %#llx, outputs %#x, fragment depth %d, dual source %d, alpha test %d, payload private %d, position block %d, LOD shift %#llx)", (unsigned long long)s->key, (unsigned long long)um, (unsigned long long)im, xo, fd, dual, at, mp, mb, (unsigned long long)lm); }
@@ -798,6 +843,7 @@ static VkShaderModule vk_shader_module_(vkshader_t *s, uint64_t um, uint64_t im,
                    s->stage == 1 ? "per-primitive inputs" : "outputs added", xo, fd, dual, at, (unsigned long long)lm, s->stage == 7 ? (mp ? (mb ? ", payload private, position block" : ", payload private") : mb ? ", position block" : "") : "");
         free(w); }
     else VKLOG("[RED] shader %016llx: no variant could be made (bindings %#llx / %#llx, outputs %#x, fragment depth %d, dual source %d, alpha test %d, payload private %d, position block %d, LOD shift %#llx)", (unsigned long long)s->key, (unsigned long long)um, (unsigned long long)im, xo, fd, dual, at, mp, mb, (unsigned long long)lm);
+    free(own);
     if (s->nvar < 16) s->var[s->nvar++] = (typeof(s->var[0])){um, im, xo, fv, m, lm};
     pthread_mutex_unlock(&g_sh_mu);
     return m;
