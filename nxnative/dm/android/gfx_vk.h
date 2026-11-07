@@ -208,6 +208,8 @@ typedef struct {
     uint64_t lod_ops;                   // its sampled bindings (bit = index in b) that take level numbers: query LOD / levels, explicit LOD, fetch levels, size by level (vk_lodshift_mask)
     int nfirst; struct { int32_t reg; uint32_t word, value; } first[4];   // a compute shader's first-invocation stores, taken out of it (shader_vk.py first_store): before each dispatch the
                                                                            // replay writes value at word of the storage buffer in slot reg (gfx_vk_exec.c first_stores)
+    int ordered;                            // a compute shader that allocates through a storage-buffer atomic (shader_vk.py ordered_alloc): a small direct dispatch runs its workgroups in
+                                            // order (gfx_vk_exec.c dispatch, DM_VK_ORDERED), as NVIDIA's GPUs start them
 } vkshader_t;
 enum { VK_COL0_NONE, VK_COL0_FLOAT, VK_COL0_INT, VK_COL0_OTHER };   // no output at location 0; a vec4 of 32-bit floats; integers; another float type
 // NVN's alpha test (gfx_vk_shader.c spv_alpha_test, gfx_vk_exec.c prepare_draw): its function (NVN_ALPHA_FUNC_*) and reference (float) are each draw's push constants, at this offset of

@@ -388,8 +388,8 @@ def classify(stage, b, res):
             return e
     e.update(kind='?'); return e
 
-# Binary reflection (dm/android/gfx_vk.h dmsv_refl / dmsv_bind): header {u32 nbind, u32 c1_len, u32 local[3]}, nbind × 20-byte bindings, then c1.
-# binding: u8 kind, u8 desc (descriptor type), u8 dim (SPIR-V Dim, 0xff none), u8 flags (1 arrayed, 2 multisampled, 4 written), u16 binding, u16 count,
+# Binary reflection (dm/android/gfx_vk.h dmsv_refl / dmsv_bind): header {u32 nbind, u32 c1_len, u32 local[3]}, nbind × 20-byte bindings, then c1, then "FSTR" (first_store) and "ORDR"
+# (ordered_alloc) sections when the shader has them. binding: u8 kind, u8 desc (descriptor type), u8 dim (SPIR-V Dim, 0xff none), u8 flags (1 arrayed, 2 multisampled, 4 written), u16 binding, u16 count,
 #          i16 reg, u8 samp (sampler source), u8 fmt (SPIR-V image format), i32 off, i32 samp_arg (a spill binding: off = the words a workgroup takes, samp_arg = the slices)
 KIND = {'support': 0, 'cbuf': 1, 'c1': 2, 'drvcb': 3, 'sbuf': 4, 'ubo_ptr': 5, 'sbuf_ubo': 6, 'tex': 7, 'tbuf': 8, 'img': 9, 'img_tbuf': 10, 'tex_c2a': 11,
         'tex_ubo': 12, 'tbuf_ubo': 13, 'img_ubo': 14, 'spill': 15, 'vt_pool': 16, 'vt_ctl': 17, 'vt_pt': 18, 'vt_fb': 19, '?': 255}   # (vt_*: gfx_vk_vt.h RK_VT_*)
@@ -406,9 +406,13 @@ if a.vt: import spv_vt   # noqa: E402  (beside this script)
 # variables (the AST's locals) are followed by value, the guard and the stores' addresses evaluated as linear forms of the invocation and workgroup ids and c0's words. Only this exact
 # condition counts (it holds for one invocation of a dispatch with a flat local size, or rows with z 1); a guarded block that holds anything else, another use of the guard after the
 # stores, or more than 4 stores leave the whole shader as it is (649e36162cad9e79 of the base game: its first invocation also loops over a uniform's count)
+# Also read (2026-11-06, found offline over 1.8.0's 729 compute shaders): an index made with OpIMul by a constant (workgroup.x * 32 + local.x), a guard the branch tests itself
+# with no local holding it, and addresses that add a word of the shader's own c1. That takes in 9d65b36d2c14177f and a52144763f3f4d33 (the visible terrain cells the vegetation
+# placement reads: their counter, slot 1 word 2, reset by the first invocation while every workgroup appends) and 4e584bc1f755b0ed; and two clear-only shaders, where moving the
+# store ahead changes nothing. Still not read: per-layer resets whose address depends on workgroup z (811ae21f81975fcb, c5e9da99764f162e)
 # instructions that are not values: stores, calls, atomics, image writes, barriers, control flow (anything else has no effect but its result)
 STMT = {62, 63, 57, 99, 224, 225, 246, 247, 248, 249, 250, 251, 252, 253, 254, 255, 4416, *range(227, 243)}
-def first_store(spv, binds, local, res):
+def first_store(spv, binds, local, res, c1=b''):   # c1: the job's own c1 bytes, whose words are constants here
     w = list(struct.unpack(f'<{len(spv) // 4}I', spv)); ins, i = [], 5
     while i < len(w): n = w[i] >> 16; ins.append((i, w[i] & 0xffff, w[i:i + n])); i += n or 1
     if not local or len(local) < 3 or local[2] != 1: return spv, []
@@ -418,6 +422,7 @@ def first_store(spv, binds, local, res):
     defs = {x[2][2]: x[2] for x in ins if x[1] in (61, 65, 124, 128, 130, 132, 194, 195, 196, 199, 200, 166, 167, 168, 170, 171, 126)}
     fvars = {x[2][2] for x in ins if x[1] == 59 and x[2][3] == 7}
     c0 = next((v for v, nm in names.items() if re.fullmatch(r'[a-z]+_c0', nm)), None)
+    c1v = next((v for v, nm in names.items() if re.fullmatch(r'[a-z]+_c1', nm)), None)   # the shader's own c1 (the job's c1 bytes): constants here
     sbuf = {b['binding']: b for b in binds if b['kind'] == 'sbuf'}
     var_bind = {x[2][1]: x[2][3] for x in ins if x[1] == 71 and len(x[2]) == 4 and x[2][2] == 33}   # Binding
     sb_by_index = sorted(res.get('sbufs', []), key=lambda x: x['binding'])
@@ -445,6 +450,8 @@ def first_store(spv, binds, local, res):
                 if None in ix: return None
                 if built.get(a[3]) in (26, 27) and len(ix) == 1: return lin((('wg' if built[a[3]] == 26 else 'lid', ix[0]), 1))
                 if a[3] == c0 and len(ix) == 3 and ix[0] == 0: return lin((('c0', 4 * ix[1] + ix[2]), 1))
+                if a[3] == c1v and c1v is not None and len(ix) == 3 and ix[0] == 0 and 16 * ix[1] + 4 * ix[2] + 4 <= len(c1):   # a word of c1: its value
+                    return lin(k=struct.unpack_from('<i', c1, 16 * ix[1] + 4 * ix[2])[0])
             return None
         if o == 200:   # OpNot: -x - 1
             v = ev(d[3], vals); return add(lin(k=-1), v, -1) if isinstance(v, dict) else None
@@ -453,6 +460,11 @@ def first_store(spv, binds, local, res):
             if o == 128 and isinstance(a, tuple) and a[0] == 'shr2' and isinstance(b, dict) and set(b) == {'k'}: return ('shr2', add(a[1], lin(k=4 * b['k'])))
             if o == 128 and isinstance(b, tuple) and b[0] == 'shr2' and isinstance(a, dict) and set(a) == {'k'}: return ('shr2', add(b[1], lin(k=4 * a['k'])))
             return add(a, b, 1 if o == 128 else -1)
+        if o == 132:   # OpIMul, one side a constant (9d65b36d2c14177f's global index: workgroup.x * 32 + local.x)
+            a_, b_ = ev(d[3], vals), ev(d[4], vals)
+            if isinstance(a_, dict) and isinstance(b_, dict) and set(b_) == {'k'}: return {t: c * b_['k'] for t, c in a_.items()}
+            if isinstance(a_, dict) and isinstance(b_, dict) and set(a_) == {'k'}: return {t: c * a_['k'] for t, c in b_.items()}
+            return None
         if o == 196:   # OpShiftLeftLogical by a constant
             v, n = ev(d[3], vals), consts.get(d[4])
             return {t: c << n for t, c in v.items()} if isinstance(v, dict) and n is not None else None
@@ -493,9 +505,10 @@ def first_store(spv, binds, local, res):
             if guard is None and isinstance(v, tuple) and v[0] == 'cond' and v[1] == want: guard = x[1]
             vals[x[1]], fvals[x[1]] = v, fv; k += 1; continue
         if o not in STMT: k += 1; continue   # a value: evaluated where used
-        if o == 247 and guard is not None and k + 1 < len(ins) and ins[k + 1][1] == 250:   # OpSelectionMerge, OpBranchConditional
+        if o == 247 and k + 1 < len(ins) and ins[k + 1][1] == 250:   # OpSelectionMerge, OpBranchConditional
             br = ins[k + 1][2]; c = ev(br[1], fvals)
             if not (isinstance(c, tuple) and c[0] == 'cond' and c[1] == want): break
+            if guard is None: guard = -1   # the branch tests the condition itself, no local holds it (9d65b36d2c14177f, a52144763f3f4d33, 4e584bc1f755b0ed)
             if not c[2] or br[3] != x[1] or k + 2 >= len(ins) or ins[k + 2][1] != 248 or ins[k + 2][2][1] != br[2]: return spv, []
             j = k + 3
             while j < len(ins) and ins[j][1] != 249:   # the block: values, locals set, storage buffer stores; anything else leaves the shader as it is
@@ -523,8 +536,46 @@ def first_store(spv, binds, local, res):
         if at not in drop: out += x
     return struct.pack(f'<{len(out)}I', *out), [e for _, e in stores]
 
-def refl_bin(binds, c1, local, first=()):
-    """... then, when the shader has first-invocation stores (first_store), "FSTR", u32 count, count x {i32 storage slot, u32 word, u32 value} after c1 (gfx_vk_shader.c reads them)"""
+# ---- a compute shader that allocates through an atomic (dispatch runs its workgroups in order: gfx_vk_exec.c dispatch, DM_VK_ORDERED) ----
+# A small dispatch's workgroups start in index order on the Switch's NVIDIA GPU, so atomics they make on one global counter (base = atomicAdd(counter, my_total)) resolve in that order in
+# practice. Adreno starts workgroups in no order, so a game relying on that (found: Mario Kart World's vegetation instance allocation) hands its items different offsets every frame. Read on
+# the translated module: any atomic read-modify-write on a storage buffer whose result is used. Workgroup-memory atomics do not count (they order invocations inside one workgroup), nor an
+# atomic whose result feeds nothing (OpAtomicStore returns nothing; OpAtomicLoad is no read-modify-write).
+# OpAtomicExchange, CompareExchange(Weak), IIncrement, IDecrement, IAdd, ISub, SMin, UMin, SMax, UMax, And, Or, Xor — not OpAtomicLoad (227) nor OpAtomicStore (228)
+OP_ATOMICS = set(range(229, 243))   # OpAtomicExchange (229) .. OpAtomicXor (242)
+OP_MEMBER_NAME, OP_LOAD, OP_STORE, OP_MEMBER_DECORATE, OP_ACCESS_CHAIN, OP_IN_BOUNDS_ACCESS_CHAIN = 6, 61, 62, 72, 65, 66   # (the other opcodes and decorations are named above)
+SC_FUNCTION = 7
+def ordered_alloc(spv):
+    w = list(struct.unpack(f'<{len(spv) // 4}I', spv)); ins, i = [], 5
+    while i < len(w): n = w[i] >> 16; ins.append((w[i] & 0xffff, w[i:i + n])); i += n or 1
+    deco = {}   # target id → {decoration: operand} (OpDecorate and OpMemberDecorate both, the latter keyed past the former's numbers)
+    for o, x in ins:
+        if o == OP_DECORATE and len(x) >= 3: deco.setdefault(x[1], {})[x[2]] = x[3] if len(x) > 3 else 1
+        elif o == OP_MEMBER_DECORATE and len(x) >= 3: deco.setdefault(x[1], {})[x[2] + 100000] = x[3] if len(x) > 3 else 1
+    ptrs = {x[1]: (x[2], x[3]) for o, x in ins if o == OP_TYPE_POINTER}   # id: (storage class, pointee type)
+    def_of = {x[2]: x for o, x in ins if o in (OP_VARIABLE, OP_ACCESS_CHAIN, OP_IN_BOUNDS_ACCESS_CHAIN) and len(x) >= 3}   # a pointer value → the instruction that made it
+    def buf_ptr(v, d=0):
+        x = def_of.get(v)   # a chain's own result type can be _ptr_Uniform_uint inside the block: resolve to the base variable, whose pointee is the struct
+        if x is None: return False
+        if x[0] & 0xffff != OP_VARIABLE: return buf_ptr(x[3], d + 1) if d < 16 else False   # the chain's base pointer
+        t = x[1]   # OpVariable [result type, result, storage class]
+        if t not in ptrs: return False
+        sc, pt = ptrs[t]; dd = deco.get(pt, {})
+        return sc in (12, 5349) or (sc == 2 and (dd.get(DEC_BLOCK) or dd.get(DEC_BUFFER_BLOCK)))   # StorageBuffer, PhysicalStorageBuffer, Uniform on a Block / BufferBlock struct
+    loads = {x[3] for o, x in ins if o == OP_LOAD and len(x) >= 4}   # the pointers some OpLoad reads
+    dead_vars = {x[2] for o, x in ins if o == OP_VARIABLE and len(x) >= 4 and x[3] == SC_FUNCTION and x[2] not in loads}   # the translator writes every register into one
+    for o, x in ins:
+        if o not in OP_ATOMICS or len(x) < 6 or not buf_ptr(x[3]): continue   # x[1] result type, x[2] result, x[3] pointer
+        # "used": the result id is an operand of some instruction other than OpName / OpMemberName / OpDecorate / OpMemberDecorate, and not an OpStore's value into a dead Function variable
+        for o2, y2 in ins:
+            if y2 is x or o2 in (OP_NAME, OP_MEMBER_NAME, OP_DECORATE, OP_MEMBER_DECORATE) or len(y2) < 3 or x[2] not in y2[2:]: continue
+            if o2 == OP_STORE and y2[1] in dead_vars: continue   # OpStore <pointer y2[1]> <value y2[2]>
+            return True
+    return False
+
+def refl_bin(binds, c1, local, first=(), ordered=False):
+    """... then, when the shader has first-invocation stores (first_store), "FSTR", u32 count, count x {i32 storage slot, u32 word, u32 value} after c1, and when it allocates through a
+    storage-buffer atomic whose result it uses (ordered_alloc), "ORDR", u32 1 (gfx_vk_shader.c reads both)"""
     out = [struct.pack('<5I', len(binds), len(c1), *(list(local) + [1, 1, 1])[:3])]
     for e in binds:
         kind = KIND.get(e['kind'], 255)
@@ -540,7 +591,9 @@ def refl_bin(binds, c1, local, first=()):
         flags = (1 if e.get('arrayed') else 0) | (2 if e.get('ms') else 0) | (4 if e.get('rw') else 0) | (8 if e.get('fetch1d') else 0)
         out.append(struct.pack('<BBBBHHhBBii', kind, DESC.get(e['type'], 255), 0xff if e.get('dim') is None else e['dim'], flags, e['binding'], e['count'],
                                reg, samp, e.get('fmt') or 0, off, sarg))
-    return b''.join(out) + bytes(c1) + (b'FSTR' + struct.pack('<I', len(first)) + b''.join(struct.pack('<iII', e['reg'], e['word'], e['value']) for e in first) if first else b'')
+    return (b''.join(out) + bytes(c1)
+            + (b'FSTR' + struct.pack('<I', len(first)) + b''.join(struct.pack('<iII', e['reg'], e['word'], e['value']) for e in first) if first else b'')
+            + (b'ORDR' + struct.pack('<I', 1) if ordered else b''))
 
 def main():
     pc, loc = {}, {}
@@ -574,7 +627,7 @@ def main():
             if ln.strip(): errs[ln.strip()[:120]] += 1
             m = re.match(r'\[RED\] ([0-9a-f]{16}): (.*)', ln.strip())
             if m: why[m.group(1)] = m.group(2)[:160]
-    entries, fails, per_stage, firsts = [], collections.Counter(), collections.defaultdict(collections.Counter), {}
+    entries, fails, per_stage, firsts, ordereds = [], collections.Counter(), collections.defaultdict(collections.Counter), {}, {}
     if a.spv_dir: os.makedirs(a.spv_dir, exist_ok=True)
     for k in keys:
         spv_p, res_p = os.path.join(w, k + '.spv'), os.path.join(w, k + '.res.json')
@@ -592,14 +645,16 @@ def main():
         cl = [classify(st, b, res) for b in binds]
         for e in cl:
             if e['kind'] == 'vt_pool': e['reg'] = dict((kk, bb) for bb, kk in vt['cands']).get(e['off']) if vt else None   # the candidate's texture binding
-        first = []
-        if st == 'cs':   # the first invocation's stores, for the replay (first_store)
-            spv, first = first_store(spv, cl, local or jobs[k].get('local'), res)
+        first = []; ordered = False
+        if st == 'cs':   # the first invocation's stores, for the replay (first_store), and the allocating atomics that want its workgroups in order (ordered_alloc)
+            spv, first = first_store(spv, cl, local or jobs[k].get('local'), res, c1=bytes.fromhex(jobs[k].get('c1') or ''))
             if first: firsts[k] = first
+            ordered = ordered_alloc(spv)
+            if ordered: ordereds[k] = True
         for e in cl: kinds_all[e['kind']] += 1
         # header words 2-4: a compute shader's local size; a vertex shader's input locations (all, signed int, unsigned int); a pixel shader's output locations
         hdr3 = (local or jobs[k].get('local') or [1, 1, 1]) if st in ('cs', 'ts', 'ms') else io[1] if st == 'vs' else io[3] if st == 'ps' else [0, 0, 0]
-        entries.append((int(k, 16), STAGES.get(st, 0), spv, refl_bin(cl, c1s[k], hdr3, first)))
+        entries.append((int(k, 16), STAGES.get(st, 0), spv, refl_bin(cl, c1s[k], hdr3, first, ordered)))
     if SPIRV_OPT:   # after the reflection and first_store, which read the translator's form
         def opt(e):
             p = os.path.join(w, f'{e[0]:016x}.opt.spv'); open(p, 'wb').write(e[2])
@@ -621,6 +676,7 @@ def main():
     print('per stage: ' + ', '.join(f'{st} {c["translated"]} translated, {c["failed"]} failed' for st, c in sorted(per_stage.items(), key=lambda kv: STAGES.get(kv[0], 9))))
     if a.vt: print(f'virtual texturing (spv_vt.py): {vt_stats["shaders"]} fragment shaders, {vt_stats["candidates"]} candidate 2D arrays, {vt_stats["without requests"]} shaders without requests (a discard or a depth write)')
     print(f'first-invocation stores made by the replay (first_store): {len(firsts)} compute shaders' + ''.join(f'\n  {k}: ' + ', '.join(f'slot {e["reg"]} word {e["word"]} = {e["value"]}' for e in v) for k, v in sorted(firsts.items())))
+    print(f'ordered allocations (ordered_alloc): {len(ordereds)} compute shaders' + ''.join(f'\n  {k}' for k in sorted(ordereds)))
     for e, n in errs.most_common(8): print(f'  translator: {n:5d}  {e}')
     shutil.rmtree(w, ignore_errors=True)
 

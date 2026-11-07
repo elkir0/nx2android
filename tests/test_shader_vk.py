@@ -10,7 +10,7 @@ SHADER_C = REPO / 'nxnative/dm/android/gfx_vk_shader.c'
 
 # shader_vk.py runs as a script (arguments, the profile, the translation): its functions and tables, without the run
 _tree = ast.parse(SHADER_VK.read_text(encoding='utf-8'))
-_keep = {'base_job', 'nvn2', 'sph_outputs', 'mesh_info', 'stage_memory', 'own_shared', 'nvn2_job', 'cs_facts', 'classify', 'refl_bin', 'captured', 'records', 'first_store'}
+_keep = {'base_job', 'nvn2', 'sph_outputs', 'mesh_info', 'stage_memory', 'own_shared', 'nvn2_job', 'cs_facts', 'classify', 'refl_bin', 'captured', 'records', 'first_store', 'ordered_alloc'}
 def _names(t): return [t.id] if isinstance(t, ast.Name) else [n for e in t.elts for n in _names(e)] if isinstance(t, ast.Tuple) else ['?']
 _run = {'HERE', 'TOOLS', 'GAME', 'FACTS', 'MAP', 'XLATE_DLL'}   # the script's paths and its profile
 _body = [n for n in _tree.body if isinstance(n, ast.FunctionDef) and n.name in _keep or isinstance(n, ast.Assign)
@@ -258,17 +258,30 @@ OpBranch %m3
 %m3 = OpLabel"""
 
 
+# FIRST with the store's offset also adding a word of the shader's own c1 (cp_c1 beside cp_c0): row, comp is byte 16 * row + 4 * comp of the job's c1 bytes
+def first_c1(row, comp):
+    w = f"""%23c = OpAccessChain %puf %c1 %i0 %i{row} %i{comp}
+%23l = OpLoad %float %23c
+%23i = OpBitcast %int %23l
+%23w = OpIAdd %int %i8 %23i
+%24 = OpIAdd %int %23 %23w"""
+    return (FIRST.replace('%24 = OpIAdd %int %23 %i8', w)
+            .replace('OpName %s0 "cp_s0"', 'OpName %s0 "cp_s0"\nOpName %c1 "cp_c1"')
+            .replace('OpDecorate %c0 Binding 1', 'OpDecorate %c0 Binding 1\nOpDecorate %c1 DescriptorSet 0\nOpDecorate %c1 Binding 3')
+            .replace('%c0 = OpVariable %pcb Uniform', '%c0 = OpVariable %pcb Uniform\n%c1 = OpVariable %pcb Uniform'))
+
+
 @unittest.skipUnless(shutil.which('spirv-as') and shutil.which('spirv-val'), 'needs spirv-as and spirv-val')
 class FirstStore(unittest.TestCase):
     BINDS = [dict(kind='sbuf', binding=2, name='cp_s0', reg=2)]
     RES = {'sbufs': [{'binding': 2, 'cb_slot': 0, 'cb_offset': 204, 'flags': 1}]}
 
-    def run_one(self, local=64, later='', src=None):
+    def run_one(self, local=64, later='', src=None, c1=b''):
         with tempfile.TemporaryDirectory() as d:
             Path(d, 'f.spvasm').write_text((src or FIRST).replace('LOCAL', str(local)).replace('LATER', later))
             subprocess.run(['spirv-as', '--target-env', 'spv1.3', str(Path(d, 'f.spvasm')), '-o', str(Path(d, 'f.spv'))], check=True, capture_output=True)
             spv = Path(d, 'f.spv').read_bytes()
-            out, first = SV['first_store'](spv, self.BINDS, [local, 1, 1], self.RES)
+            out, first = SV['first_store'](spv, self.BINDS, [local, 1, 1], self.RES, **({'c1': c1} if c1 else {}))
             Path(d, 'o.spv').write_bytes(out)
             v = subprocess.run(['spirv-val', '--target-env', 'vulkan1.3', str(Path(d, 'o.spv'))], capture_output=True, text=True)
             self.assertEqual(v.returncode, 0, v.stderr)
@@ -304,6 +317,120 @@ class FirstStore(unittest.TestCase):
         old = FIRST[FIRST.index('%21 = OpAccessChain'):FIRST.index('%31 = OpAccessChain %puu %s0 %i0 %30') + len('%31 = OpAccessChain %puu %s0 %i0 %30')]
         spv, out, first = self.run_one(src=FIRST.replace(old, wide))
         self.assertEqual(first, [{'reg': 2, 'word': 2, 'value': 1}])
+
+    def test_an_index_made_with_imul(self):   # 9d65b36d2c14177f: the global index is workgroup.x * 32 + local.x, an OpIMul by the local size
+        src = FIRST.replace('%i6 = OpConstant %int 6', '%i32 = OpConstant %int 32').replace(
+            '%7 = OpShiftLeftLogical %int %6 %i6', '%7 = OpIMul %int %6 %i32')
+        spv, out, first = self.run_one(local=32, src=src)
+        self.assertEqual(first, [{'reg': 2, 'word': 2, 'value': 1}])
+        self.assertEqual(len(out), len(spv) - 12)
+
+    def test_a_guard_the_branch_tests_itself(self):   # a52144763f3f4d33: the condition feeds OpBranchConditional itself, no local holds it
+        src = (FIRST.replace('%vnf = OpVariable %pfb Function\n', '').replace('OpStore %vnf %14\n', '')
+               .replace('%16 = OpLoad %bool %vnf\n%17 = OpLogicalNot %bool %16', '%17 = OpLogicalNot %bool %14')
+               .replace('%19 = OpLoad %bool %vnf\n%20 = OpLogicalNot %bool %19\nOpSelectionMerge %m2 None\nOpBranchConditional %20 %t2 %m2',
+                        'OpSelectionMerge %m2 None\nOpBranchConditional %17 %t2 %m2'))
+        spv, out, first = self.run_one(src=src)
+        self.assertEqual(first, [{'reg': 2, 'word': 2, 'value': 1}])
+        self.assertEqual(len(out), len(spv) - 12)   # the store gone and the module still valid without it
+
+    def test_an_address_with_a_c1_word(self):   # 9d65b36d2c14177f: the store's address adds a word of the shader's own c1
+        spv, out, first = self.run_one(src=first_c1(0, 2), c1=struct.pack('<3i', 0, 0, 8))
+        self.assertEqual(first, [{'reg': 2, 'word': 4, 'value': 1}])   # word 2 plus the c1 word 8: +2 words
+        self.assertEqual(len(out), len(spv) - 12)
+
+    def test_a_c1_word_past_the_bytes_given(self):   # row 2 is byte 32, past the 12 bytes given: the word is not a constant
+        spv, out, first = self.run_one(src=first_c1(2, 0), c1=struct.pack('<3i', 0, 0, 8))
+        self.assertEqual((first, out), ([], spv))
+
+    def test_a_guard_on_workgroup_z_is_left(self):   # 811ae21f81975fcb: a per-layer counter, its address walks workgroup z
+        src = FIRST.replace('%24 = OpIAdd %int %23 %i8', """%8z = OpAccessChain %pinu %wg %i2
+%9z = OpLoad %uint %8z
+%10z = OpBitcast %int %9z
+%11z = OpIMul %int %i8 %10z
+%24 = OpIAdd %int %23 %11z""")
+        spv, out, first = self.run_one(src=src)
+        self.assertEqual((first, out), ([], spv))
+
+
+# A compute shader that allocates through a storage-buffer atomic (shader_vk.py ordered_alloc): its workgroups must start in order, as NVIDIA's GPUs do them. The module holds a
+# storage buffer (Uniform + BufferBlock) whose word 0 is the counter, and BODY's %old the atomic's result
+ALLOC = """OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %wg
+OpExecutionMode %main LocalSize 32 1 1
+OpName %s0 "cp_s0"
+OpDecorate %ra ArrayStride 4
+OpMemberDecorate %sb 0 Offset 0
+OpDecorate %sb BufferBlock
+OpDecorate %s0 DescriptorSet 0
+OpDecorate %s0 Binding 2
+OpDecorate %wg BuiltIn WorkgroupId
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%v3u = OpTypeVector %uint 3
+%ra = OpTypeRuntimeArray %uint
+%sb = OpTypeStruct %ra
+%psb = OpTypePointer Uniform %sb
+%puu = OpTypePointer Uniform %uint
+%s0 = OpVariable %psb Uniform
+%pin3 = OpTypePointer Input %v3u
+%wg = OpVariable %pin3 Input
+EXTRA
+%u0 = OpConstant %uint 0
+%u1 = OpConstant %uint 1
+%u2 = OpConstant %uint 2
+%main = OpFunction %void None %fn
+%l0 = OpLabel
+FUNCVARS
+BODY
+OpReturn
+OpFunctionEnd
+"""
+
+
+@unittest.skipUnless(shutil.which('spirv-as') and shutil.which('spirv-val'), 'needs spirv-as and spirv-val')
+class OrderedAlloc(unittest.TestCase):
+    def alloc(self, body, extra='', funcvars=''):
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, 'a.spvasm').write_text(ALLOC.replace('EXTRA', extra).replace('FUNCVARS', funcvars).replace('BODY', body))
+            subprocess.run(['spirv-as', '--target-env', 'spv1.3', str(Path(d, 'a.spvasm')), '-o', str(Path(d, 'a.spv'))], check=True, capture_output=True)
+            return Path(d, 'a.spv').read_bytes()
+
+    CHAIN = '%p = OpAccessChain %puu %s0 %u0 %u0\n%old = OpAtomicIAdd %uint %p %u1 %u0 %u1'   # the counter at word 0
+    OUT = '%q = OpAccessChain %puu %s0 %u0 %u2\nOpStore %q %old'                              # the result to word 2
+
+    def test_a_used_storage_buffer_atomic(self):
+        spv = self.alloc(self.CHAIN + '\n' + self.OUT)
+        self.assertIs(SV['ordered_alloc'](spv), True)
+
+    def test_an_unused_result(self):
+        spv = self.alloc(self.CHAIN)   # the atomic's result feeds nothing
+        self.assertIs(SV['ordered_alloc'](spv), False)
+
+    def test_an_iincrement_ticket(self):   # OpAtomicIIncrement (232): a ticket, no value operand
+        spv = self.alloc('%p = OpAccessChain %puu %s0 %u0 %u0\n%old = OpAtomicIIncrement %uint %p %u1 %u0\n' + self.OUT)
+        self.assertIs(SV['ordered_alloc'](spv), True)
+
+    def test_a_workgroup_memory_atomic_does_not_count(self):   # it orders invocations inside one workgroup
+        spv = self.alloc('%p = OpCopyObject %pwu %sh\n%old = OpAtomicIAdd %uint %p %u1 %u0 %u1\n' + self.OUT,
+                         extra='%pwu = OpTypePointer Workgroup %uint\n%sh = OpVariable %pwu Workgroup\n')
+        self.assertIs(SV['ordered_alloc'](spv), False)
+
+    def test_a_result_only_stored_into_a_dead_function_variable(self):   # the translator's register write, no OpLoad of it
+        spv = self.alloc(self.CHAIN + '\nOpStore %fv %old', extra='%pfu = OpTypePointer Function %uint\n',
+                         funcvars='%fv = OpVariable %pfu Function\n')
+        self.assertIs(SV['ordered_alloc'](spv), False)
+
+    def test_refl_bin_ends_with_ordr(self):
+        r = SV['refl_bin']([], b'', [32, 1, 1], (), True)
+        self.assertEqual(r[20:], b'ORDR' + struct.pack('<I', 1))
+        first = [{'reg': 2, 'word': 2, 'value': 1}]
+        r = SV['refl_bin']([], b'', [32, 1, 1], first, True)   # both sections: FSTR, then ORDR
+        self.assertTrue(r[20:].startswith(b'FSTR' + struct.pack('<I', 1)))
+        self.assertTrue(r[20:].endswith(b'ORDR' + struct.pack('<I', 1)))
+        self.assertNotIn(b'ORDR', SV['refl_bin']([], b'', [32, 1, 1])[-8:])   # off: no tag
 
 
 def xlate_cmd():

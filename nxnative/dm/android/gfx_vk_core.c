@@ -17,6 +17,7 @@
 #include <android/hardware_buffer.h>
 #include <dlfcn.h>
 #include <errno.h>
+#include <stdarg.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -29,6 +30,10 @@ static PFN_vkGetInstanceProcAddr p_vkGetInstanceProcAddr;
 vkdev_t V;
 pthread_mutex_t g_vk_queue_mu = PTHREAD_MUTEX_INITIALIZER;   // VkQueue access is externally synchronized: submissions and presents (and the sparse binds, gfx_vk_tex.c, on q or sq)
 static int g_vk_ready;   // vk_ready
+// the live diagnostics' settings (gfx_vk_exec.c x_read): the writers' watched range (vk_gpu_wrote), the reccap line cap (completion_main) and the pass its lines name
+extern uint64_t g_x_watch_lo, g_x_watch_hi; extern int g_x_writers_on;
+extern uint64_t g_x_reccap_lines; extern uint32_t g_x_reccap_dropped; extern int g_x_reccap_capped;
+int vk_sub_pass_now(void);   // the pass being replayed (gfx_vk_exec.c)
 
 uint32_t vk_mem_type(uint32_t bits, VkMemoryPropertyFlags want, VkMemoryPropertyFlags avoid) {
     for (uint32_t i = 0; i < V.mem.memoryTypeCount; i++)
@@ -917,7 +922,7 @@ static VkQueryPool g_cq;
 typedef struct { VkBuffer b; VkDeviceMemory m; uint8_t *p; VkDeviceSize size, used; uint32_t idle; } scratch_blk;   // idle: the slot's recycles since it was last used (scratch_trim)
 static uint64_t g_scratch_bytes, g_scratch_freed;   // scratch blocks made and live, and freed by scratch_trim (vk_mem_log)
 typedef struct { int kind; void *a; void *b; } dfree_t;   // 0 buffer+memory, 1 image+memory, 2 view
-typedef struct { int kind; volatile uint32_t *val; uint32_t mode, v; uint64_t addr; uint32_t type; int q; } post_op;   // q: a timestamp counter's query in g_cq, or -1
+typedef struct { int kind; volatile uint32_t *val; uint32_t mode, v; uint64_t addr; uint32_t type; int q; void *p; } post_op;   // q: a timestamp counter's query in g_cq, or -1; p: kind 3's capture
 struct vksub {
     VkCommandPool pool; VkCommandBuffer up, main; int up_used;
     VkCommandBuffer mains[MAIN_CBS]; int nmain_alloc, nmain_used, cb_err;
@@ -1443,6 +1448,15 @@ void vk_keep_flush(void) {   // every kept set is dropped (the caller forgets th
 
 // ---------------- submissions: begin, CPU-visible effects, commit ----------------
 static void post(post_op o) { vksub_t *s = cur(); if (s->npost == s->cappost) { s->cappost = s->cappost ? 2 * s->cappost : 64; s->post = realloc(s->post, s->cappost * sizeof *s->post); } s->post[s->npost++] = o; }
+// DM_VK_X_RECCAP (gfx_vk_exec.c): one range of indirect-draw records copied off the GPU at a pass's end, queued for the completion thread to log. The scratch
+// pointer is read there and only there, before this submission's g_done advances: the slot is not recycled until the completion thread has passed its fence
+// (slot_recycle waits, then scratch_trim frees), so between the copy and the read no later work can overwrite the bytes
+typedef struct { uint64_t present; int pass; uint64_t key, addr, cnt; uint32_t n, stride, rs; int has_count; const uint32_t *p; } vk_reccap_t;
+void vk_post_reccap(uint64_t present, int pass, uint64_t key, uint64_t addr, uint64_t cnt, uint32_t n, uint32_t stride, uint32_t rs, int has_count, const uint32_t *p) {
+    vk_reccap_t *d = malloc(sizeof *d); if (!d) return;
+    *d = (vk_reccap_t){present, pass, key, addr, cnt, n, stride, rs, has_count, p};
+    post((post_op){3, NULL, 0, 0, 0, 0, -1, d});
+}
 void mtl_init(void) { vk_init(); }
 // The first submission's prepare step, outside the graphics gate (hle_nvn.c nvnQueueSubmitCommands; nvn_mtl.m mtl_prepare: the prewarm and the pipeline prebuild): the device is
 // made here, which takes the driver a while, so a suspend meanwhile does not wait in the gate for it. The pipeline prewarm itself already runs on background threads (gfx_vk_exec.c
@@ -1509,6 +1523,7 @@ void vk_img_barrier_all(VkCommandBuffer cb) {
     vk_bar_recorded(cb); g_bar_full++;
 }
 void vk_gpu_wrote(uint64_t a, uint64_t n);
+void vk_wrote_by(const char *fmt, ...);   // (defined by vk_gpu_wrote: names the work whose writes follow)
 void mtl_sub_copy(uint64_t src, uint64_t dst, uint64_t n) {
     VkBuffer sb, db; VkDeviceSize so, dof;
     if (!n) return;
@@ -1516,7 +1531,7 @@ void mtl_sub_copy(uint64_t src, uint64_t dst, uint64_t n) {
     vk_end_pass_land();
     VkCommandBuffer cb = vk_cmd(); vk_img_barrier_all(cb);
     VkBufferCopy r = {so, dof, n}; vkCmdCopyBuffer(cb, sb, db, 1, &r);
-    vk_img_barrier_all(cb); vk_gpu_wrote(dst, n);
+    vk_img_barrier_all(cb); if (g_x_writers_on) vk_wrote_by("buffer copy from %#llx", (unsigned long long)src); vk_gpu_wrote(dst, n);   // (DM_VK_X_WRITERS: the copy's kind)
 }
 void mtl_sub_fill(uint64_t dst, uint64_t n, uint32_t value) {
     VkBuffer db; VkDeviceSize dof;
@@ -1525,7 +1540,7 @@ void mtl_sub_fill(uint64_t dst, uint64_t n, uint32_t value) {
     vk_end_pass_land();
     VkCommandBuffer cb = vk_cmd(); vk_img_barrier_all(cb);
     vkCmdFillBuffer(cb, db, dof, n & ~3ull, value);
-    vk_img_barrier_all(cb); vk_gpu_wrote(dst, n);
+    vk_img_barrier_all(cb); if (g_x_writers_on) vk_wrote_by("buffer fill %#x", value); vk_gpu_wrote(dst, n);   // (DM_VK_X_WRITERS: the fill's kind)
 }
 // an inline uniform update (UpdateUniformBuffer): the bytes are taken at record time, copied in GPU order from scratch memory
 // Inline uniform updates (UpdateUniformBuffer) are deferred instead of ending the render pass (as nvn_mtl.m's ubd_*): a copy cannot run inside a pass, and
@@ -1604,7 +1619,23 @@ static void sub_gpu_wrote(uint64_t a, uint64_t n) {   // into the open submissio
     if (best >= 0 && (bd <= 65536 || s->ngw == GW_SUB)) { if (lo < s->gw[best].lo) s->gw[best].lo = lo; if (hi > s->gw[best].hi) s->gw[best].hi = hi; }
     else { s->gw[s->ngw].lo = lo; s->gw[s->ngw].hi = hi; s->ngw++; }
 }
+// DM_VK_X_WRITERS=<guest address hex>[+<length hex>] (live, debugging; parsed in gfx_vk_exec.c x_read): the GPU work about to call vk_gpu_wrote names itself here
+// first (a dispatch's compute shader, storage register and size; the kind of a copy or fill), and each distinct name that writes over the watched range is logged
+// once. Graphics stages that write storage buffers are not tracked today, so such a writer is not logged
+char g_vk_writer[112];
+void vk_wrote_by(const char *fmt, ...) { va_list ap; va_start(ap, fmt); vsnprintf(g_vk_writer, sizeof g_vk_writer, fmt, ap); va_end(ap); }
+enum { WR_MAX = 64 };
+static struct { char who[112]; } g_wr[WR_MAX]; static int g_nwr;
+void vk_writers_reset(void) { g_nwr = 0; }
 void vk_gpu_wrote(uint64_t a, uint64_t n) {
+    // DM_VK_X_WRITERS: the check runs before the range merge below, which would fold a second writer's write of the same range into the first's and hide it
+    if (g_x_writers_on && n && a < g_x_watch_hi && g_x_watch_lo < a + n) {
+        int seen = 0; for (int i = 0; i < g_nwr; i++) seen |= !strcmp(g_wr[i].who, g_vk_writer);
+        if (!seen && g_nwr < WR_MAX) { snprintf(g_wr[g_nwr++].who, sizeof g_wr[0].who, "%s", g_vk_writer);
+            extern uint64_t g_tex_frame;
+            VKLOG("writers: %s writes %#llx +%llu over the watched %#llx +%llu (present %llu, pass %d)", g_vk_writer, (unsigned long long)a, (unsigned long long)n,
+                  (unsigned long long)g_x_watch_lo, (unsigned long long)(g_x_watch_hi - g_x_watch_lo), (unsigned long long)g_tex_frame, vk_sub_pass_now()); }
+        else if (!seen) VKRED_ONCE(185, "writers: 64 distinct writers logged, later ones not (set DM_VK_X_WRITERS again for a new list)"); }
     uint64_t f = g_fence + 1;
     for (int i = g_ngw - 1; i >= 0 && g_gw[i].fence == f; i--) if (g_gw[i].lo <= a && a + n <= g_gw[i].hi) return;
     if (g_ngw == GW_MAX) { uint64_t done = vk_fence_done(); int o = 0; for (int i = 0; i < g_ngw; i++) if (g_gw[i].fence > done) g_gw[o++] = g_gw[i]; g_ngw = o; }
@@ -1706,6 +1737,19 @@ static void *completion_main(void *a) {
         for (int i = 0; i < c->n; i++) {
             post_op *o = &c->ops[i];
             if (o->kind == 1) { volatile uint32_t *val = vk_cpu_ptr((uint64_t)(uintptr_t)o->val, 4); if (val) { if (o->mode == 1) *val += o->v; else *val = o->v; } continue; }
+            if (o->kind == 3) {   // DM_VK_X_RECCAP's capture (vk_post_reccap): logged here, after the fence, while the slot's scratch still holds the copy
+                vk_reccap_t *d = o->p; const uint32_t *w = d->p;
+                if (d->has_count && g_x_reccap_lines < 4096) { g_x_reccap_lines++;
+                    VKLOG("reccap: present %llu pass %d vs %016llx count %#llx: %u", (unsigned long long)d->present, d->pass, (unsigned long long)d->key,
+                          (unsigned long long)d->cnt, w[(d->stride * (d->n - 1) + d->rs) / 4]); }
+                for (uint32_t k = 0; k < d->n && g_x_reccap_lines < 4096; k++) { g_x_reccap_lines++; const uint32_t *r = (const uint32_t *)((const uint8_t *)w + (size_t)k * d->stride);
+                    if (d->rs == 20) VKLOG("reccap: present %llu pass %d vs %016llx record %#llx: count %u instances %u first index %u vertex offset %d first instance %u",
+                                           (unsigned long long)d->present, d->pass, (unsigned long long)d->key, (unsigned long long)(d->addr + (uint64_t)k * d->stride), r[0], r[1], r[2], (int32_t)r[3], r[4]);
+                    else VKLOG("reccap: present %llu pass %d vs %016llx record %#llx: count %u instances %u first vertex %u first instance %u",
+                               (unsigned long long)d->present, d->pass, (unsigned long long)d->key, (unsigned long long)(d->addr + (uint64_t)k * d->stride), r[0], r[1], r[2], r[3]); }
+                if (g_x_reccap_lines >= 4096 && !g_x_reccap_capped) { g_x_reccap_capped = 1;
+                    VKLOG("reccap: 4096 lines reached, no more logged this setting%s", g_x_reccap_dropped ? " (draws' record ranges past 128 a pass dropped too)" : ""); }
+                free(d); continue; }
             uint64_t ts = now, tq;
             // DM_VK_TS_FLAT=1 (live, debugging): every report of a submission at its completion time, so a game measures no GPU time between two of them
             if (!g_ts_flat && o->q >= 0 && tend && vkGetQueryPoolResults(V.dev, g_cq, (uint32_t)o->q, 1, 8, &tq, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && tq <= tend) {

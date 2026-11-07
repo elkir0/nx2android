@@ -812,6 +812,12 @@ NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
     if (!o->fenced) { SEQ("syncwait %p unfenced", (void *)s); return NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED; }
     int acq = o->fenced == 2;   // a WindowAcquireTexture sync: its own line in the wait ledger (mtl_wait_acq)
     if (nvn_fence_wait(o->fence, 0, acq)) { SEQ("syncwait %p kind %u already", (void *)s, o->fenced); return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED; }
+    // DM_NVN_X_SYNCPOLL=<ms> (live, debugging): a wait of under 1 ms (a poll) on GPU work not done yet waits up to that long instead, and such polls are counted: a game
+    // that leaves out work whose GPU results are not ready when it polls finds them done (Mario Kart World's trees missing from the main pass of some frames, 2026-11-06)
+    { static _Atomic uint64_t polls; static uint64_t chk; static int poll_ms; uint64_t tn = now_ns();
+      if (tn - chk > 200000000ull) { chk = tn; const char *e = getenv("DM_NVN_X_SYNCPOLL"); poll_ms = e ? atoi(e) : 0; }
+      if (timeout < 1000000ull) { uint64_t n = atomic_fetch_add(&polls, 1) + 1; if (!(n & (n - 1)) || !(n % 4096)) LOG("[nvn] SyncWait polls (under 1 ms) on GPU work not done: %llu%s", (unsigned long long)n, poll_ms > 0 ? " (DM_NVN_X_SYNCPOLL: waited for)" : "");
+                                  if (poll_ms > 0) timeout = (uint64_t)poll_ms * 1000000ull; } }
     uint64_t t0 = now_ns(); int r = nvn_fence_wait(o->fence, timeout, acq); atomic_fetch_add(&g_sync_ns, now_ns() - t0);   // the frame's blocked SyncWait time (@sync_ms)
     SEQ("syncwait %p kind %u timeout %llu waited %.2f ms -> %d", (void *)s, o->fenced, (unsigned long long)timeout, (now_ns() - t0) / 1e6, r);
     return r ? NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED : NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;

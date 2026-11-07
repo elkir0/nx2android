@@ -405,10 +405,13 @@ vkshader_t *vk_shader(uint64_t key, int stage) {
     const uint8_t *r = g_bundle + e->refl_off; uint32_t hdr[5]; memcpy(hdr, r, 20);
     s->nbind = (int)hdr[0]; s->c1_len = hdr[1]; memcpy(s->local, hdr + 2, 12);
     s->b = (const dmsv_bind *)(r + 20); s->c1 = r + 20 + 20 * s->nbind;
-    // after c1, "FSTR": the stores only a dispatch's first invocation made, taken out of the shader (shader_vk.py first_store), {i32 slot, u32 word, u32 value} each: the replay makes them
+    // after c1, "FSTR": the stores only a dispatch's first invocation made, taken out of the shader (shader_vk.py first_store), {i32 slot, u32 word, u32 value} each: the replay makes them;
+    // then "ORDR": the shader allocates through a storage-buffer atomic (shader_vk.py ordered_alloc), so a small dispatch of it runs its workgroups in order (gfx_vk_exec.c dispatch)
     { uint32_t at = 20 + 20 * (uint32_t)s->nbind + s->c1_len, n = 0;
       if (e->refl_len >= at + 8 && !memcmp(r + at, "FSTR", 4)) { memcpy(&n, r + at + 4, 4);
-          for (uint32_t i = 0; i < n && i < 4 && at + 8 + 12 * (i + 1) <= e->refl_len; i++) { memcpy(&s->first[i], r + at + 8 + 12 * i, 12); s->nfirst = (int)i + 1; } } }
+          for (uint32_t i = 0; i < n && i < 4 && at + 8 + 12 * (i + 1) <= e->refl_len; i++) { memcpy(&s->first[i], r + at + 8 + 12 * i, 12); s->nfirst = (int)i + 1; }
+          at += 8 + 12 * n; }
+      if (e->refl_len >= at + 8 && !memcmp(r + at, "ORDR", 4)) { memcpy(&n, r + at + 4, 4); s->ordered = n == 1; } }
     // SPIR-V with the stage's set, and the facts read from it (shader_words)
     uint32_t nw = 0, *w = shader_words(s, e, &nw, 1);
     VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, (size_t)nw * 4, w};
